@@ -150,6 +150,59 @@ function callComponent(fn: (props: unknown) => unknown, props: unknown): unknown
   }
 }
 
+// ─── User components in child lists ─────────────────────────────────
+//
+// Every Forme primitive is a function component that returns null: it is
+// recognised by identity and serialized by its own arm, never called. Any
+// other function component is the user's, and what it RETURNS stands in its
+// place. That result can be an array or a fragment as well as one element, so
+// it has to be flattened exactly like inline children are. Serializing it as
+// a single child lost both shapes (issue #159): an array fails
+// `isValidElement`, and a fragment has no serializer arm.
+
+const FORME_PRIMITIVES: ReadonlySet<unknown> = new Set<unknown>([
+  Document, Page, View, Text, H1, H2, H3, H4, H5, H6, OrderedList, UnorderedList, ListItem,
+  Strong, Em, Code, Link, Image, Table, Row, Cell, Fixed, Svg, QrCode, Barcode, Canvas,
+  Watermark, PageBreak, BarChart, LineChart, PieChart, AreaChart, DotPlot, TextField,
+  Checkbox, Dropdown, RadioButton,
+]);
+
+function isUserComponent(child: unknown): child is ReactElement {
+  return isValidElement(child)
+    && typeof child.type === 'function'
+    && !FORME_PRIMITIVES.has(child.type)
+    && !isDocumentType(child.type);
+}
+
+/**
+ * Replace each user component in an already-flattened child list with its
+ * own flattened result, recursively, so a component contributes its nodes in
+ * place: none for null, several for an array or fragment.
+ */
+function expandComponents(children: unknown[], flatten: (c: unknown) => unknown[]): unknown[] {
+  const out: unknown[] = [];
+  for (const child of children) {
+    if (isUserComponent(child)) {
+      const result = callComponent(child.type as (props: unknown) => unknown, child.props);
+      out.push(...expandComponents(flatten(result), flatten));
+    } else {
+      out.push(child);
+    }
+  }
+  return out;
+}
+
+/**
+ * Where exactly one node fits (an `$each` template, an expression branch, a
+ * component passed straight to a single-child slot), a component result of
+ * several nodes is grouped in a plain View rather than cut to its first.
+ */
+function oneNode<T>(nodes: T[]): T | Record<string, unknown> | null {
+  if (nodes.length === 0) return null;
+  if (nodes.length === 1) return nodes[0];
+  return { kind: { type: 'View' }, style: {}, children: nodes };
+}
+
 // ─── Public API ──────────────────────────────────────────────────────
 
 /**
@@ -164,7 +217,7 @@ export function serialize(element: ReactElement): FormeDocument {
   }
 
   const props = element.props as DocumentProps & { children?: unknown };
-  const childElements = flattenChildren(props.children);
+  const childElements = expandComponents(flattenChildren(props.children), flattenChildren);
 
   // Separate Page children from content children
   const pageNodes: FormeNode[] = [];
@@ -415,20 +468,15 @@ function serializeChild(child: unknown, parent: ParentContext = null): FormeNode
     const props = element.props as { children?: unknown };
     const childElements = flattenChildren(props.children);
     const nodes = serializeChildren(childElements, parent);
-    return nodes.length === 1 ? nodes[0] : {
-      kind: { type: 'View' },
-      style: {},
-      children: nodes,
-    };
+    return oneNode(nodes) as FormeNode | null;
   }
 
-  // Unknown component — try to call it as a function component
+  // Unknown component: call it and serialize whatever it returned, with the
+  // same flattening inline children get. Child lists expand components before
+  // they reach here (`serializeChildren`), so this only runs where one node fits.
   if (typeof element.type === 'function') {
     const result = callComponent(element.type as (props: unknown) => unknown, element.props);
-    if (isValidElement(result)) {
-      return serializeChild(result, parent);
-    }
-    return null;
+    return oneNode(serializeChildren(flattenChildren(result), parent)) as FormeNode | null;
   }
 
   return null;
@@ -564,6 +612,8 @@ function serializeText(element: ReactElement): FormeNode {
 // component. A new component needs one builder, not two.
 interface SerializerCtx {
   flatten: (children: unknown) => unknown[];
+  /** `flatten`, then user components replaced by their flattened results. */
+  nodeChildren: (children: unknown) => unknown[];
   style: (style?: Style) => Record<string, unknown>;
   /** Plain text content — a string, or a `$ref` marker on the template path. */
   textContent: (children: unknown) => unknown;
@@ -577,6 +627,7 @@ interface SerializerCtx {
 
 const MAIN_CTX: SerializerCtx = {
   flatten: (c) => flattenChildren(c),
+  nodeChildren: (c) => expandComponents(flattenChildren(c), flattenChildren),
   style: (s) => mapStyle(s) as Record<string, unknown>,
   textContent: (c) => flattenTextContent(c),
   isRunChild: (c) => inlineDefaults(c.type) !== null,
@@ -587,6 +638,7 @@ const MAIN_CTX: SerializerCtx = {
 
 const TEMPLATE_CTX: SerializerCtx = {
   flatten: (c) => flattenTemplateChildren(c),
+  nodeChildren: (c) => expandComponents(flattenTemplateChildren(c), flattenTemplateChildren),
   style: (s) => mapTemplateStyle(s),
   textContent: (c) => flattenTemplateTextContent(c),
   // The template path's own convention for Text, kept exactly: a nested
@@ -683,7 +735,7 @@ function buildListItem(element: ReactElement, ctx: SerializerCtx): Record<string
   // we serialize whatever the user put inside as the node's children. This
   // covers plain strings, JSX text, nested lists, formatted runs via
   // <Text>, etc.
-  const rawChildren = ctx.flatten(props.children);
+  const rawChildren = ctx.nodeChildren(props.children);
   const children: unknown[] = [];
   for (const c of rawChildren) {
     if (typeof c === 'string' || typeof c === 'number') {
@@ -1085,7 +1137,7 @@ function flattenChildren(children: unknown): unknown[] {
 
 function serializeChildren(children: unknown[], parent: ParentContext = null): FormeNode[] {
   const nodes: FormeNode[] = [];
-  for (const child of children) {
+  for (const child of expandComponents(children, flattenChildren)) {
     const node = serializeChild(child, parent);
     if (node) nodes.push(node);
   }
@@ -1144,7 +1196,7 @@ export function serializeTemplate(element: ReactElement): Record<string, unknown
   }
 
   const props = element.props as { title?: string; author?: string; subject?: string; creator?: string; children?: unknown } & DocumentProps;
-  const childElements = flattenTemplateChildren(props.children);
+  const childElements = expandComponents(flattenTemplateChildren(props.children), flattenTemplateChildren);
 
   const pageNodes: unknown[] = [];
   const contentNodes: unknown[] = [];
@@ -1335,13 +1387,11 @@ function serializeTemplateChild(child: unknown, parent: ParentContext = null): u
     return serializeTemplatePage(element);
   }
 
-  // Unknown function component — call it
+  // Unknown function component: call it and serialize its result with the
+  // same flattening inline children get (see the `serializeChild` fallback).
   if (typeof element.type === 'function') {
     const result = callComponent(element.type as (props: unknown) => unknown, element.props);
-    if (isValidElement(result)) {
-      return serializeTemplateChild(result, parent);
-    }
-    return null;
+    return oneNode(serializeTemplateChildren(flattenTemplateChildren(result), parent));
   }
 
   return null;
@@ -1455,7 +1505,7 @@ function serializeTemplateFixed(element: ReactElement): Record<string, unknown> 
 
 function serializeTemplateChildren(children: unknown[], parent: ParentContext = null): unknown[] {
   const nodes: unknown[] = [];
-  for (const child of children) {
+  for (const child of expandComponents(children, flattenTemplateChildren)) {
     const node = serializeTemplateChild(child, parent);
     if (node !== null) nodes.push(node);
   }
