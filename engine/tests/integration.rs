@@ -2073,6 +2073,246 @@ fn test_multiple_links_on_same_page() {
     );
 }
 
+// ── Inline links (issue #157) ───────────────────────────────────
+//
+// A <Link href> wrapping one span inside a <Text> paragraph serializes as a
+// run with `href` in `kind.runs`. The JSON below is the shape
+// @formepdf/react's serialize() produces for
+// `<Text>See <Link href="...">docs</Link> now.</Text>`, minus the Link's
+// default color/underline style, which does not affect the geometry here.
+
+/// One parsed /Link annotation: its /Rect and its target.
+#[derive(Debug)]
+struct ParsedLink {
+    rect: [f64; 4],
+    uri: Option<String>,
+    goto: bool,
+    struct_parent: bool,
+}
+
+fn parse_link_annotations(pdf: &[u8]) -> Vec<ParsedLink> {
+    let text = String::from_utf8_lossy(pdf);
+    let mut out = Vec::new();
+    for chunk in text.split("/Subtype /Link").skip(1) {
+        let dict_end = chunk.find("endobj").unwrap_or(chunk.len());
+        let dict = &chunk[..dict_end];
+        let r_start = dict.find("/Rect [").expect("link annotation has /Rect") + 7;
+        let r_end = r_start + dict[r_start..].find(']').unwrap();
+        let nums: Vec<f64> = dict[r_start..r_end]
+            .split_whitespace()
+            .map(|n| n.parse().unwrap())
+            .collect();
+        let uri = dict.find("/URI (").map(|s| {
+            let s = s + 6;
+            let e = s + dict[s..].find(')').unwrap();
+            dict[s..e].to_string()
+        });
+        out.push(ParsedLink {
+            rect: [nums[0], nums[1], nums[2], nums[3]],
+            uri,
+            goto: dict.contains("/S /GoTo"),
+            struct_parent: dict.contains("/StructParent "),
+        });
+    }
+    out
+}
+
+fn inline_link_json(text_style: &str, runs: &str, text_href: Option<&str>, tagged: bool) -> String {
+    let href = text_href
+        .map(|h| format!(r#", "href": "{h}""#))
+        .unwrap_or_default();
+    format!(
+        r#"{{
+        "tagged": {tagged},
+        "children": [
+            {{
+                "kind": {{ "type": "Text", "content": ""{href}, "runs": [{runs}] }},
+                "style": {{ "fontSize": 12{text_style} }},
+                "children": []
+            }}
+        ]
+    }}"#
+    )
+}
+
+const SEE_DOCS_NOW: &str = r#"
+    { "content": "See " },
+    { "content": "docs", "href": "https://example.com/inline" },
+    { "content": " now." }"#;
+
+const SEE_DOCS_NOW_PLAIN: &str = r#"
+    { "content": "See " },
+    { "content": "docs" },
+    { "content": " now." }"#;
+
+#[test]
+fn test_inline_link_run_produces_span_sized_annotation() {
+    let bytes = forme::render_json(&inline_link_json("", SEE_DOCS_NOW, None, false)).unwrap();
+    assert_valid_pdf(&bytes);
+    let links = parse_link_annotations(&bytes);
+    assert_eq!(
+        links.len(),
+        1,
+        "exactly one link annotation for the linked span, got {links:?}"
+    );
+    let link = &links[0];
+    assert_eq!(link.uri.as_deref(), Some("https://example.com/inline"));
+
+    // Control: the same paragraph linked as a whole. Its annotation covers
+    // the paragraph box, so the span's rect must sit inside it and be
+    // narrower.
+    let control = forme::render_json(&inline_link_json(
+        "",
+        SEE_DOCS_NOW_PLAIN,
+        Some("https://example.com/inline"),
+        false,
+    ))
+    .unwrap();
+    let whole = parse_link_annotations(&control);
+    assert_eq!(whole.len(), 1, "whole-Text control: {whole:?}");
+    let w = whole[0].rect;
+    let r = link.rect;
+    // "See " is 4 Helvetica glyphs at 12pt: the span starts after it.
+    assert!(
+        r[0] > w[0] + 15.0,
+        "span starts after 'See ': span {r:?} para {w:?}"
+    );
+    assert!(
+        r[2] < w[2],
+        "span ends inside the paragraph: {r:?} vs {w:?}"
+    );
+    // "docs" in Helvetica 12pt: (556+556+500+500)/1000*12 = 25.34pt.
+    let width = r[2] - r[0];
+    assert!(
+        (width - 25.34).abs() < 0.5,
+        "span rect covers exactly 'docs' (25.34pt), got {width:.2}"
+    );
+    assert!(
+        r[1] >= w[1] - 0.01 && r[3] <= w[3] + 0.01 && r[3] > r[1],
+        "span rect lies within the text line vertically: {r:?} vs {w:?}"
+    );
+}
+
+#[test]
+fn test_inline_link_run_wrapping_two_lines_gets_rect_per_line() {
+    let runs = r#"
+        { "content": "See the " },
+        { "content": "sit amet consectetur adipiscing", "href": "https://example.com/wrap" },
+        { "content": " elit." }"#;
+    let style = r#", "width": { "Pt": 110 }"#;
+    let bytes = forme::render_json(&inline_link_json(style, runs, None, false)).unwrap();
+    let links = parse_link_annotations(&bytes);
+    assert!(
+        links.len() >= 2,
+        "a span wrapping onto a second line gets one rect per line, got {links:?}"
+    );
+    for l in &links {
+        assert_eq!(l.uri.as_deref(), Some("https://example.com/wrap"));
+        assert!(l.rect[2] - l.rect[0] <= 110.0 + 0.01, "{l:?}");
+    }
+    // Lines are stacked: no two rects overlap vertically.
+    let mut sorted: Vec<[f64; 4]> = links.iter().map(|l| l.rect).collect();
+    sorted.sort_by(|a, b| b[1].partial_cmp(&a[1]).unwrap());
+    for pair in sorted.windows(2) {
+        assert!(
+            pair[1][3] <= pair[0][1] + 0.01,
+            "per-line rects must not overlap: {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+    // Every rect lies within the paragraph, and the first line's starts
+    // after "See the ", not at the paragraph's left edge.
+    let control = forme::render_json(&inline_link_json(
+        style,
+        runs,
+        Some("https://example.com/wrap"),
+        false,
+    ))
+    .unwrap();
+    let whole = parse_link_annotations(&control);
+    assert_eq!(whole.len(), 1, "whole-Text control: {whole:?}");
+    let para = whole[0].rect;
+    for l in &links {
+        assert!(
+            l.rect[1] >= para[1] - 0.01 && l.rect[3] <= para[3] + 0.01,
+            "every per-line rect lies within the paragraph: {l:?} vs {para:?}"
+        );
+    }
+    assert!(
+        sorted[0][0] > para[0] + 1.0,
+        "the first line's rect starts mid-line: {:?} vs {para:?}",
+        sorted[0]
+    );
+}
+
+#[test]
+fn test_whole_text_href_with_runs_does_not_double_emit() {
+    // Runs inherit the Text's href onto every glyph; the element-level
+    // annotation already covers them, so no per-span annotation is added.
+    let runs = r#"
+        { "content": "See " },
+        { "content": "docs", "href": "https://example.com/whole" },
+        { "content": " now." }"#;
+    let bytes = forme::render_json(&inline_link_json(
+        "",
+        runs,
+        Some("https://example.com/whole"),
+        false,
+    ))
+    .unwrap();
+    let links = parse_link_annotations(&bytes);
+    assert_eq!(
+        links.len(),
+        1,
+        "one annotation, not one per span: {links:?}"
+    );
+}
+
+#[test]
+fn test_inline_internal_link_run_produces_goto() {
+    let json = r##"{
+        "children": [
+            {
+                "kind": { "type": "Text", "content": "", "runs": [
+                    { "content": "Jump to " },
+                    { "content": "the section", "href": "#Section A" },
+                    { "content": " below." }
+                ] },
+                "style": { "fontSize": 12 },
+                "children": []
+            },
+            {
+                "kind": { "type": "Text", "content": "Section A" },
+                "style": { "fontSize": 12 },
+                "bookmark": "Section A",
+                "children": []
+            }
+        ]
+    }"##;
+    let bytes = forme::render_json(json).unwrap();
+    let links = parse_link_annotations(&bytes);
+    assert_eq!(links.len(), 1, "{links:?}");
+    assert!(links[0].goto, "internal run link is a GoTo: {links:?}");
+    assert!(links[0].uri.is_none());
+}
+
+#[test]
+fn test_inline_link_run_tagged_has_struct_parent() {
+    let bytes = forme::render_json(&inline_link_json("", SEE_DOCS_NOW, None, true)).unwrap();
+    let links = parse_link_annotations(&bytes);
+    assert_eq!(links.len(), 1, "{links:?}");
+    assert!(
+        links[0].struct_parent,
+        "tagged inline link annotation carries /StructParent: {links:?}"
+    );
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("/S /Link"),
+        "a /Link structure element holds the annotation"
+    );
+}
+
 #[test]
 fn test_text_decoration_underline_json() {
     let json = r#"{
