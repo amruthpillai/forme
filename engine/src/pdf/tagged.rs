@@ -565,8 +565,8 @@ impl TagBuilder {
             );
 
             if let Some(ref alt) = elem.alt {
-                let escaped = super::PdfWriter::escape_pdf_string(alt);
-                let _ = write!(dict, " /Alt ({})", escaped);
+                let encoded = super::PdfWriter::encode_text_string(alt);
+                let _ = write!(dict, " /Alt {}", encoded);
             }
 
             // Table cell attributes in a single /A dict with owner /Table:
@@ -596,8 +596,8 @@ impl TagBuilder {
             // 2.0 namespace so the 1.7 shape stays byte-identical.
             if ns_2_0 && elem.alt.is_none() {
                 if let Some(ref at) = elem.actual_text {
-                    let escaped = super::PdfWriter::escape_pdf_string(at);
-                    let _ = write!(dict, " /ActualText ({})", escaped);
+                    let encoded = super::PdfWriter::encode_text_string(at);
+                    let _ = write!(dict, " /ActualText {}", encoded);
                 }
             }
 

@@ -14444,3 +14444,136 @@ fn docinfo_producer_and_creator_match_xmp() {
         "/Title must equal dc:title"
     );
 }
+
+// ── Every other PDF text string (issue #158 follow-up) ───────────────────
+
+/// Assert that the string after `key` in `hay` is a `<FEFF...>` text
+/// string decoding to `want`.
+fn assert_utf16_text(hay: &[u8], key: &str, want: &str) {
+    let (got, hex) =
+        decode_text_string_after(hay, key).unwrap_or_else(|| panic!("{key} not found"));
+    assert!(
+        hex,
+        "{key} must be a <FEFF...> UTF-16BE string, got the literal {got:?}"
+    );
+    assert_eq!(got, want, "{key} must decode back to the input");
+}
+
+#[test]
+fn structure_alt_non_ascii_is_utf16be() {
+    // /Alt is a text string (ISO 32000-1 Table 323); screen readers read
+    // it aloud, so raw UTF-8 there is mojibake spoken to the user.
+    let json = r#"{ "children": [
+        { "kind": { "type": "Svg", "width": 50, "height": 50, "content": "<rect width=\"50\" height=\"50\" fill=\"red\"/>" },
+          "alt": "Grünes Quadrat", "style": {}, "children": [] }
+    ], "metadata": {}, "tagged": true }"#;
+    let bytes = forme::render_json(json).expect("renders");
+    assert_utf16_text(&bytes, "/Alt", "Grünes Quadrat");
+}
+
+#[test]
+fn form_field_text_strings_non_ascii_are_utf16be() {
+    // Field /T, /V, /DV and choice /Opt entries are text strings
+    // (ISO 32000-1 Tables 220, 222, 231).
+    let json = r#"{ "children": [
+        { "kind": { "type": "TextField", "name": "Straße", "width": 200, "height": 24,
+            "value": "Müller", "font_size": 12, "multiline": false, "password": false, "read_only": false },
+          "style": {}, "children": [] },
+        { "kind": { "type": "Dropdown", "name": "größe", "width": 150, "height": 24,
+            "options": ["Klein", "Groß"], "value": "Groß", "font_size": 12, "read_only": false },
+          "style": {}, "children": [] }
+    ], "metadata": {} }"#;
+    let bytes = forme::render_json(json).expect("renders");
+    let text = String::from_utf8_lossy(&bytes);
+    // Byte offsets, not offsets into the lossy string: compressed streams
+    // make the two diverge.
+    let find = |needle: &[u8]| bytes.windows(needle.len()).position(|w| w == needle);
+    let tx = find(b"/FT /Tx").expect("text field widget");
+    let tx = &bytes[tx..];
+    assert_utf16_text(tx, "/T ", "Straße");
+    assert_utf16_text(tx, "/V ", "Müller");
+    assert_utf16_text(tx, "/DV ", "Müller");
+    let ch = find(b"/FT /Ch").expect("choice widget");
+    let ch = &bytes[ch..];
+    assert_utf16_text(ch, "/T ", "größe");
+    assert_utf16_text(ch, "/V ", "Groß");
+    let opt = text[text.find("/Opt [").unwrap()..].to_string();
+    assert!(
+        opt.starts_with("/Opt [(Klein) <FEFF"),
+        "ASCII option stays a literal, non-ASCII becomes UTF-16BE: {}",
+        opt.chars().take(40).collect::<String>()
+    );
+}
+
+#[test]
+fn attachment_desc_and_uf_non_ascii_are_utf16be() {
+    // /Desc and /UF are text strings (ISO 32000-1 Table 44); /F is a byte
+    // string and keeps the literal form.
+    let json = r#"{ "children": [ { "kind": { "type": "Text", "content": "x" }, "style": {}, "children": [] } ],
+        "metadata": {},
+        "attachments": [ { "name": "Übersicht.csv", "src": "YSxiCjEsMg==", "mimeType": "text/csv", "description": "Monatsübersicht" } ] }"#;
+    let bytes = forme::render_json(json).expect("renders");
+    assert_utf16_text(&bytes, "/UF", "Übersicht.csv");
+    assert_utf16_text(&bytes, "/Desc", "Monatsübersicht");
+}
+
+#[test]
+fn link_contents_non_ascii_is_utf16be() {
+    // A link annotation's /Contents is a text string (Table 164). /URI is
+    // an ASCII byte string (Table 206) and keeps the literal form.
+    let internal = r##"{ "children": [
+        { "kind": { "type": "Text", "content": "jump", "href": "#Übersicht" }, "style": {} },
+        { "kind": { "type": "PageBreak" } },
+        { "kind": { "type": "View" }, "bookmark": "Übersicht", "children": [ { "kind": { "type": "Text", "content": "target" } } ] }
+    ] }"##;
+    let bytes = forme::render_json(internal).expect("renders");
+    assert_utf16_text(&bytes, "/F 4 /Contents", "Link to Übersicht");
+
+    let external = r#"{ "children": [
+        { "kind": { "type": "Text", "content": "go", "href": "https://example.com/straße" }, "style": {} }
+    ] }"#;
+    let bytes = forme::render_json(external).expect("renders");
+    assert_utf16_text(&bytes, "/F 4 /Contents", "https://example.com/straße");
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("/URI (https://example.com/stra"),
+        "/URI stays a literal byte string"
+    );
+}
+
+#[test]
+fn signature_text_strings_non_ascii_are_utf16be() {
+    // /Reason, /Location and /ContactInfo are text strings (Table 252).
+    let (cert_pem, key_pem) = generate_test_cert_and_key();
+    let unsigned_pdf = render_to_pdf(&default_doc(vec![make_text("sig", 12.0)]));
+    let config = forme::CertificationConfig {
+        certificate_pem: cert_pem,
+        private_key_pem: key_pem,
+        reason: Some("Geprüft".to_string()),
+        location: Some("Zürich".to_string()),
+        contact: Some("jürgen@example.com".to_string()),
+        visible: false,
+        x: None,
+        y: None,
+        width: None,
+        height: None,
+    };
+    let signed = forme::certify_pdf(&unsigned_pdf, &config).unwrap();
+    assert_utf16_text(&signed, "/Reason", "Geprüft");
+    assert_utf16_text(&signed, "/Location", "Zürich");
+    assert_utf16_text(&signed, "/ContactInfo", "jürgen@example.com");
+}
+
+#[test]
+fn docinfo_emitted_for_subject_alone() {
+    // A subject with no title or author used to be dropped: /Info was
+    // only written when title or author was set.
+    let json = r#"{ "children": [ { "kind": { "type": "Text", "content": "x" }, "style": {}, "children": [] } ],
+        "metadata": { "subject": "Quarterly numbers" } }"#;
+    let bytes = forme::render_json(json).expect("renders");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("/Subject (Quarterly numbers)"),
+        "a subject-only document must still write /Info"
+    );
+    assert!(text.contains("/Info "), "the trailer must reference /Info");
+}

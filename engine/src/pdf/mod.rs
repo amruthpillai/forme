@@ -502,7 +502,7 @@ impl PdfWriter {
                             .unwrap_or_default();
                         // PDF/UA 7.18.1-2 / 7.18.5-2: a link annotation must
                         // carry an alternate description in its /Contents key.
-                        let contents = Self::escape_pdf_string(&format!("Link to {anchor}"));
+                        let contents = Self::encode_text_string(&format!("Link to {anchor}"));
                         // ISO 14289-2 8.8: "All destinations whose target
                         // lies within the current document shall be
                         // structure destinations." Under UA-2 the GoTo also
@@ -520,7 +520,7 @@ impl PdfWriter {
                         };
                         let annot_dict = format!(
                             "<< /Type /Annot /Subtype /Link /Rect {} /Border [0 0 0] \
-                             /F 4 /Contents ({}){} \
+                             /F 4 /Contents {}{} \
                              /A << /S /GoTo /D [{} 0 R /XYZ 0 {:.2} null]{} >> >>",
                             rect, contents, sp_str, bm.page_obj_id, bm.y_pdf, sd_str
                         );
@@ -541,12 +541,16 @@ impl PdfWriter {
                         })
                         .map(|sp| format!(" /StructParent {}", sp))
                         .unwrap_or_default();
+                    // /Contents is a text string; /URI is a 7-bit ASCII
+                    // byte string (ISO 32000-1 Table 206), so it keeps the
+                    // plain literal.
+                    let contents = Self::encode_text_string(&annot.href);
                     let href_esc = Self::escape_pdf_string(&annot.href);
                     let annot_dict = format!(
                         "<< /Type /Annot /Subtype /Link /Rect {} /Border [0 0 0] \
-                         /F 4 /Contents ({}){} \
+                         /F 4 /Contents {}{} \
                          /A << /Type /Action /S /URI /URI ({}) >> >>",
-                        rect, href_esc, sp_str, href_esc
+                        rect, contents, sp_str, href_esc
                     );
                     builder.objects.push(PdfObject {
                         id: annot_obj_id,
@@ -774,19 +778,22 @@ impl PdfWriter {
 
             let fs_obj_id = builder.objects.len();
             let mut fs_data = format!(
-                "<< /Type /Filespec /F ({name}) /UF ({name}) /EF << /F {ef} 0 R >> /AFRelationship /{rel}",
+                "<< /Type /Filespec /F ({name}) /UF {uf} /EF << /F {ef} 0 R >> /AFRelationship /{rel}",
+                // /F is a byte string, /UF the text-string form of the
+                // same name (ISO 32000-1 Table 44).
                 name = Self::escape_pdf_string(&att.name),
+                uf = Self::encode_text_string(&att.name),
                 ef = ef_obj_id,
                 rel = relationship.pdf_name(),
             );
             if let Some(desc) = &att.description {
-                let _ = write!(fs_data, " /Desc ({})", Self::escape_pdf_string(desc));
+                let _ = write!(fs_data, " /Desc {}", Self::encode_text_string(desc));
             } else if builder.pdf_version == crate::model::PdfVersion::V2_0 {
                 // ISO 14289-2 8.14.1: "The Desc entry shall be present on
                 // all file specification dictionaries present in the
                 // EmbeddedFiles name tree." The file name is the honest
                 // default when the author gave no description.
-                let _ = write!(fs_data, " /Desc ({})", Self::escape_pdf_string(&att.name));
+                let _ = write!(fs_data, " /Desc {}", Self::encode_text_string(&att.name));
             }
             fs_data.push_str(" >>");
             builder.objects.push(PdfObject {
@@ -977,9 +984,9 @@ impl PdfWriter {
                         };
                         let v_str = if let Some(ref v) = value {
                             format!(
-                                " /V ({}) /DV ({})",
-                                Self::escape_pdf_string(v),
-                                Self::escape_pdf_string(v)
+                                " /V {} /DV {}",
+                                Self::encode_text_string(v),
+                                Self::encode_text_string(v)
                             )
                         } else {
                             String::new()
@@ -1034,11 +1041,11 @@ impl PdfWriter {
                         let widget_obj_id = builder.objects.len();
                         let widget_dict = format!(
                             "<< /Type /Annot /Subtype /Widget /FT /Tx \
-                             /T ({}) /Rect {} /P {}\
+                             /T {} /Rect {} /P {}\
                              {} /DA ({}) /Ff {}{} \
                              /MK << /BC [0.6 0.6 0.6] /BG [1 1 1] >> \
                              /AP << /N {} 0 R >> >>",
-                            Self::escape_pdf_string(&field.name),
+                            Self::encode_text_string(&field.name),
                             rect,
                             page_ref,
                             v_str,
@@ -1071,11 +1078,11 @@ impl PdfWriter {
                         let widget_obj_id = builder.objects.len();
                         let widget_dict = format!(
                             "<< /Type /Annot /Subtype /Widget /FT /Btn \
-                             /T ({}) /Rect {} /P {} \
+                             /T {} /Rect {} /P {} \
                              /V /{} /AS /{}{} \
                              /MK << /BC [0.6 0.6 0.6] /CA (4) >> \
                              /AP << /N << /Yes {} 0 R /Off {} 0 R >> >> >>",
-                            Self::escape_pdf_string(&field.name),
+                            Self::encode_text_string(&field.name),
                             rect,
                             page_ref,
                             state,
@@ -1105,11 +1112,11 @@ impl PdfWriter {
                         }
                         let opts_str: String = options
                             .iter()
-                            .map(|o| format!("({})", Self::escape_pdf_string(o)))
+                            .map(|o| Self::encode_text_string(o))
                             .collect::<Vec<_>>()
                             .join(" ");
                         let v_str = if let Some(ref v) = value {
-                            format!(" /V ({})", Self::escape_pdf_string(v))
+                            format!(" /V {}", Self::encode_text_string(v))
                         } else {
                             String::new()
                         };
@@ -1154,12 +1161,12 @@ impl PdfWriter {
                         let widget_obj_id = builder.objects.len();
                         let widget_dict = format!(
                             "<< /Type /Annot /Subtype /Widget /FT /Ch \
-                             /T ({}) /Rect {} /P {} \
+                             /T {} /Rect {} /P {} \
                              /Opt [{}]{} \
                              /DA (/Helv {} Tf 0 g) /Ff {} \
                              /MK << /BC [0.6 0.6 0.6] /BG [1 1 1] >> \
                              /AP << /N {} 0 R >> >>",
-                            Self::escape_pdf_string(&field.name),
+                            Self::encode_text_string(&field.name),
                             rect,
                             page_ref,
                             opts_str,
@@ -1262,8 +1269,8 @@ impl PdfWriter {
                 }
 
                 let parent_dict = format!(
-                    "<< /FT /Btn /T ({}) /Ff {} /Kids [{}] /V /{} >>",
-                    Self::escape_pdf_string(group_name),
+                    "<< /FT /Btn /T {} /Ff {} /Kids [{}] /V /{} >>",
+                    Self::encode_text_string(group_name),
                     flags,
                     kids_refs,
                     Self::escape_pdf_string(&checked_value),
@@ -1413,7 +1420,7 @@ impl PdfWriter {
         // Document metadata lives in the XMP stream, emitted above
         // unconditionally for 2.0.
         let info_obj_id = if pdf_version == crate::model::PdfVersion::V1_7
-            && (metadata.title.is_some() || metadata.author.is_some())
+            && (metadata.title.is_some() || metadata.author.is_some() || metadata.subject.is_some())
         {
             let id = builder.objects.len();
             let mut info = String::from("<< ");
