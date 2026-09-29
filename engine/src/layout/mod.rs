@@ -873,9 +873,65 @@ pub struct PositionedGlyph {
     pub text_decoration: TextDecoration,
     /// Letter spacing applied to this glyph.
     pub letter_spacing: f64,
-    /// For ligature glyphs, the full cluster text (e.g., "fi" for an fi ligature).
-    /// `None` for 1:1 char-to-glyph mappings.
+    /// For glyphs of a cluster spanning several chars, the full cluster text
+    /// (e.g., "fi" for an fi ligature). `None` for 1:1 char-to-glyph mappings.
     pub cluster_text: Option<String>,
+    /// True when this glyph ALONE stands for every char of `cluster_text`: a
+    /// many-to-one substitution such as the "ffi" ligature. The PDF writer
+    /// maps such a glyph to its whole cluster in the ToUnicode CMap, so text
+    /// extraction reads "office" and not "ofice" (issue #156).
+    ///
+    /// False for glyphs that SHARE a multi-char cluster with other glyphs
+    /// (Indic reordering, base plus mark). Those carry the same
+    /// `cluster_text` on every glyph, so no single one of them may claim the
+    /// whole string in the CMap: a shared matra glyph would otherwise map to
+    /// whichever base it was first seen with.
+    pub ligature: bool,
+}
+
+/// The `(cluster_text, ligature)` pair for each shaped glyph, in glyph order.
+///
+/// A cluster runs from its start index up to the next LARGER cluster start
+/// among all glyphs, or to the end of `chars`. Taking the next larger start,
+/// rather than the start of the next glyph in output order, matters for RTL:
+/// shaped RTL output is in visual order, so cluster values DESCEND and "the
+/// next glyph's cluster" is the previous cluster, which used to give a lam-alef
+/// ligature the text of every char after it.
+///
+/// A multi-char cluster that owns exactly one glyph is a ligature; that glyph
+/// gets the cluster text and `ligature = true` regardless of the glyph count
+/// of the line. Glyphs of a multi-char cluster with several glyphs keep the
+/// long-standing behaviour: every one of them carries the cluster text when
+/// the run has fewer glyphs than chars (so `LayoutInfo` and the render audit
+/// see those chars), and none is a ligature.
+fn cluster_texts(shaped: &[shaping::ShapedGlyph], chars: &[char]) -> Vec<(Option<String>, bool)> {
+    let num_chars = chars.len();
+    let fewer_glyphs_than_chars = shaped.len() < num_chars;
+    let mut starts: Vec<u32> = shaped.iter().map(|g| g.cluster).collect();
+    starts.sort_unstable();
+
+    shaped
+        .iter()
+        .map(|sg| {
+            let first = starts.partition_point(|&c| c < sg.cluster);
+            let past = starts.partition_point(|&c| c <= sg.cluster);
+            let glyphs_in_cluster = past - first;
+            let start = sg.cluster as usize;
+            let end = starts
+                .get(past)
+                .map_or(num_chars, |&c| c as usize)
+                .min(num_chars);
+            if end <= start + 1 {
+                return (None, false);
+            }
+            let ligature = glyphs_in_cluster == 1;
+            if ligature || fewer_glyphs_than_chars {
+                (Some(chars[start..end].iter().collect()), ligature)
+            } else {
+                (None, false)
+            }
+        })
+        .collect()
 }
 
 /// Shift a layout element and all its nested content (children, text lines)
@@ -5296,25 +5352,10 @@ impl LayoutEngine {
                             );
                             let scale = style.font_size / units_per_em as f64;
 
-                            for sg in &shaped {
+                            let clusters = cluster_texts(&shaped, &sub_chars);
+                            for (sg, (cluster_text, ligature)) in shaped.iter().zip(clusters) {
                                 let cluster = sg.cluster as usize;
                                 let char_value = sub_chars.get(cluster).copied().unwrap_or(' ');
-
-                                let cluster_text = if shaped.len() < sub_chars.len() {
-                                    let cluster_end =
-                                        self.find_cluster_end(&shaped, sg, sub_chars.len());
-                                    if cluster_end > cluster + 1 {
-                                        Some(
-                                            sub_chars[cluster..cluster_end]
-                                                .iter()
-                                                .collect::<String>(),
-                                        )
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                };
 
                                 let glyph_x = x + sg.x_offset as f64 * scale;
                                 let glyph_y = sg.y_offset as f64 * scale;
@@ -5335,6 +5376,7 @@ impl LayoutEngine {
                                     text_decoration: style.text_decoration,
                                     letter_spacing: style.letter_spacing,
                                     cluster_text,
+                                    ligature,
                                 });
                                 bidi_levels.push(bidi_run.level);
                                 x += advance;
@@ -5370,6 +5412,7 @@ impl LayoutEngine {
                             text_decoration: style.text_decoration,
                             letter_spacing: style.letter_spacing,
                             cluster_text: None,
+                            ligature: false,
                         });
                         bidi_levels.push(bidi_run.level);
                         x += advance;
@@ -5408,21 +5451,10 @@ impl LayoutEngine {
                     if let Some(shaped) =
                         shaping::shape_text_with_direction(&run_text, font_data, run.is_rtl)
                     {
-                        for sg in &shaped {
+                        let clusters = cluster_texts(&shaped, &run_chars);
+                        for (sg, (cluster_text, ligature)) in shaped.iter().zip(clusters) {
                             let cluster = sg.cluster as usize;
                             let char_value = run_chars.get(cluster).copied().unwrap_or(' ');
-
-                            let cluster_text = if shaped.len() < run_chars.len() {
-                                let cluster_end =
-                                    self.find_cluster_end(&shaped, sg, run_chars.len());
-                                if cluster_end > cluster + 1 {
-                                    Some(run_chars[cluster..cluster_end].iter().collect::<String>())
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
 
                             let glyph_x = x + sg.x_offset as f64 * scale;
                             let glyph_y = sg.y_offset as f64 * scale;
@@ -5443,6 +5475,7 @@ impl LayoutEngine {
                                 text_decoration: style.text_decoration,
                                 letter_spacing: style.letter_spacing,
                                 cluster_text,
+                                ligature,
                             });
                             bidi_levels.push(run.level);
 
@@ -5509,6 +5542,7 @@ impl LayoutEngine {
                     text_decoration: style.text_decoration,
                     letter_spacing: style.letter_spacing,
                     cluster_text: None,
+                    ligature: false,
                 }
             })
             .collect();
@@ -5704,6 +5738,7 @@ impl LayoutEngine {
                 text_decoration: sc.text_decoration,
                 letter_spacing: sc.letter_spacing,
                 cluster_text: None,
+                ligature: false,
             });
             bidi_levels.push(if is_rtl {
                 unicode_bidi::Level::rtl()
@@ -5742,23 +5777,10 @@ impl LayoutEngine {
         let mut result = Vec::with_capacity(shaped.len());
         let mut x = 0.0_f64;
 
-        for sg in shaped {
+        let clusters = cluster_texts(shaped, chars);
+        for (sg, (cluster_text, ligature)) in shaped.iter().zip(clusters) {
             let cluster = sg.cluster as usize;
             let char_value = chars.get(cluster).copied().unwrap_or(' ');
-
-            // Determine cluster text for ligatures
-            let cluster_text = if shaped.len() < chars.len() {
-                // There are fewer glyphs than chars: likely ligatures.
-                // Find end of this cluster.
-                let cluster_end = self.find_cluster_end(shaped, sg, chars.len());
-                if cluster_end > cluster + 1 {
-                    Some(chars[cluster..cluster_end].iter().collect::<String>())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
 
             // Use shaped position
             let glyph_x = x + sg.x_offset as f64 * scale;
@@ -5780,6 +5802,7 @@ impl LayoutEngine {
                 text_decoration,
                 letter_spacing,
                 cluster_text,
+                ligature,
             });
 
             x += advance;
@@ -5802,21 +5825,11 @@ impl LayoutEngine {
         let base_x = char_positions.first().copied().unwrap_or(0.0);
         let mut x = 0.0_f64;
 
-        for sg in shaped {
+        let clusters = cluster_texts(shaped, chars);
+        for (sg, (cluster_text, ligature)) in shaped.iter().zip(clusters) {
             let cluster = sg.cluster as usize;
             let sc = styled_chars.get(cluster).unwrap_or(&styled_chars[0]);
             let char_value = chars.get(cluster).copied().unwrap_or(' ');
-
-            let cluster_text = if shaped.len() < chars.len() {
-                let cluster_end = self.find_cluster_end(shaped, sg, chars.len());
-                if cluster_end > cluster + 1 {
-                    Some(chars[cluster..cluster_end].iter().collect::<String>())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
 
             let glyph_x = base_x + x + sg.x_offset as f64 * scale;
             let glyph_y = sg.y_offset as f64 * scale;
@@ -5837,29 +5850,13 @@ impl LayoutEngine {
                 text_decoration: sc.text_decoration,
                 letter_spacing: sc.letter_spacing,
                 cluster_text,
+                ligature,
             });
 
             x += advance;
         }
 
         result
-    }
-
-    /// Find the end index of a cluster in shaped glyphs.
-    fn find_cluster_end(
-        &self,
-        shaped: &[shaping::ShapedGlyph],
-        current: &shaping::ShapedGlyph,
-        num_chars: usize,
-    ) -> usize {
-        // Find the next glyph's cluster value
-        for sg in shaped {
-            if sg.cluster > current.cluster {
-                return sg.cluster as usize;
-            }
-        }
-        // Last glyph: cluster extends to end of text
-        num_chars
     }
 
     /// The ONE image sizing ladder — used by both `layout_image` and
@@ -7667,7 +7664,9 @@ impl LayoutEngine {
                                 italic,
                             ) as f64;
 
-                            for sg in &shaped_glyphs {
+                            let clusters = cluster_texts(&shaped_glyphs, &text_chars);
+                            for (sg, (cluster_text, ligature)) in shaped_glyphs.iter().zip(clusters)
+                            {
                                 let advance = sg.x_advance as f64 / units_per_em * *font_size;
                                 let cluster_idx = sg.cluster as usize;
                                 let ch = text_chars.get(cluster_idx).copied().unwrap_or(' ');
@@ -7685,7 +7684,8 @@ impl LayoutEngine {
                                     href: None,
                                     text_decoration: TextDecoration::None,
                                     letter_spacing: style.letter_spacing,
-                                    cluster_text: None,
+                                    cluster_text,
+                                    ligature,
                                 });
                                 x_pos += advance + style.letter_spacing;
                             }
@@ -7714,6 +7714,7 @@ impl LayoutEngine {
                                     text_decoration: TextDecoration::None,
                                     letter_spacing: style.letter_spacing,
                                     cluster_text: None,
+                                    ligature: false,
                                 });
                                 x_pos += w + style.letter_spacing;
                             }
@@ -8129,6 +8130,78 @@ fn baseline_in_line(line_height: f64, font_size: f64, (ascent, descent): (f64, f
 mod tests {
     use super::*;
     use crate::font::FontContext;
+
+    fn sg(glyph_id: u16, cluster: u32) -> shaping::ShapedGlyph {
+        shaping::ShapedGlyph {
+            glyph_id,
+            cluster,
+            x_advance: 500,
+            y_advance: 0,
+            x_offset: 0,
+            y_offset: 0,
+        }
+    }
+
+    #[test]
+    fn test_cluster_texts_ltr_ligature() {
+        // "office": o, ffi-ligature (cluster 1..4), c, e.
+        let chars: Vec<char> = "office".chars().collect();
+        let shaped = [sg(1, 0), sg(2, 1), sg(3, 4), sg(4, 5)];
+        let got = cluster_texts(&shaped, &chars);
+        assert_eq!(
+            got,
+            vec![
+                (None, false),
+                (Some("ffi".to_string()), true),
+                (None, false),
+                (None, false)
+            ]
+        );
+    }
+
+    /// RTL output is in visual order, so clusters DESCEND. A lam-alef style
+    /// ligature at clusters 1..3 of "abcd" must get "bc", not "bcd" (the old
+    /// code took the first glyph with a larger cluster, which in descending
+    /// order is the LAST cluster of the run).
+    #[test]
+    fn test_cluster_texts_rtl_ligature_uses_next_larger_cluster() {
+        let chars: Vec<char> = "abcd".chars().collect();
+        let shaped = [sg(1, 3), sg(2, 1), sg(3, 0)];
+        let got = cluster_texts(&shaped, &chars);
+        assert_eq!(
+            got,
+            vec![(None, false), (Some("bc".to_string()), true), (None, false)]
+        );
+    }
+
+    /// A ligature is recognised even when another cluster decomposes into two
+    /// glyphs and the line's glyph count equals its char count, which the old
+    /// `glyphs < chars` guard read as "no ligatures here".
+    #[test]
+    fn test_cluster_texts_ligature_found_when_counts_balance() {
+        // chars a b c d: "ab" ligates (1 glyph), "d" decomposes (2 glyphs).
+        let chars: Vec<char> = "abcd".chars().collect();
+        let shaped = [sg(1, 0), sg(2, 2), sg(3, 3), sg(4, 3)];
+        let got = cluster_texts(&shaped, &chars);
+        assert_eq!(got[0], (Some("ab".to_string()), true));
+        assert_eq!(got[1], (None, false));
+        assert_eq!(got[2], (None, false));
+        assert_eq!(got[3], (None, false));
+    }
+
+    /// Several glyphs sharing a multi-char cluster: none is a ligature; each
+    /// carries the cluster text when the run has fewer glyphs than chars,
+    /// as before.
+    #[test]
+    fn test_cluster_texts_multi_glyph_cluster_is_not_a_ligature() {
+        // chars k i x y: cluster 0 = "kix" drawn as 2 glyphs, then y.
+        let chars: Vec<char> = "kixy".chars().collect();
+        let shaped = [sg(1, 0), sg(2, 0), sg(3, 3)];
+        let got = cluster_texts(&shaped, &chars);
+        assert_eq!(got[0], (Some("kix".to_string()), false));
+        assert_eq!(got[1], (Some("kix".to_string()), false));
+        assert_eq!(got[2], (None, false));
+    }
 
     fn make_text(content: &str, font_size: f64) -> Node {
         Node {

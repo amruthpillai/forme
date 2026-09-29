@@ -14275,3 +14275,134 @@ fn a_flex_item_margin_is_free_space_a_grow_sibling_cannot_take() {
         grower.width
     );
 }
+
+// ─── Issue #156: ligature glyphs in the ToUnicode CMap ──────────
+
+/// Every bfchar destination in every ToUnicode CMap of `pdf`, decoded from
+/// UTF-16BE (surrogate pairs included) into a Rust string.
+fn tounicode_destinations(pdf: &[u8]) -> Vec<String> {
+    let text = decompress_pdf_streams(pdf);
+    let mut out = Vec::new();
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find("beginbfchar") {
+        let body_start = start + "beginbfchar".len();
+        let Some(end) = rest[body_start..].find("endbfchar") else {
+            break;
+        };
+        let body = &rest[body_start..body_start + end];
+        let tokens: Vec<&str> = body
+            .split(['<', '>'])
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+        for pair in tokens.chunks(2) {
+            if let [_, dst] = pair {
+                let units: Vec<u16> = (0..dst.len())
+                    .step_by(4)
+                    .map(|i| u16::from_str_radix(&dst[i..i + 4], 16).unwrap())
+                    .collect();
+                out.push(String::from_utf16(&units).unwrap());
+            }
+        }
+        rest = &rest[body_start + end..];
+    }
+    out
+}
+
+fn noto_sans_bytes() -> Vec<u8> {
+    std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fonts/NotoSans-Regular.ttf"
+    ))
+    .expect("engine/fonts/NotoSans-Regular.ttf is in the repo")
+}
+
+/// Render a single Text node (given as the JSON for its `kind` and `style`)
+/// with Noto Sans registered as the custom family `Lig`.
+fn render_with_ligature_font(kind: &str, style: &str) -> Vec<u8> {
+    let font_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        noto_sans_bytes(),
+    );
+    let json = format!(
+        r#"{{
+            "children": [{{ "kind": {kind}, "style": {style}, "children": [] }}],
+            "metadata": {{}},
+            "defaultPage": {{
+                "size": "A4",
+                "margin": {{ "top": 54, "right": 54, "bottom": 54, "left": 54 }},
+                "wrap": true
+            }},
+            "fonts": [{{
+                "family": "Lig",
+                "src": "data:font/ttf;base64,{font_b64}",
+                "weight": 400,
+                "italic": false
+            }}]
+        }}"#
+    );
+    forme::render_json(&json).expect("renders")
+}
+
+/// Issue #156: a ligature glyph (one glyph for "ffi") got a ToUnicode entry
+/// for its FIRST character only, so extraction read "office" as "ofice".
+/// Covers all three shaping paths that build PositionedGlyphs.
+#[test]
+fn test_ligature_glyphs_map_to_every_char_in_tounicode() {
+    // Precondition: the font really forms ffi / fi / fl ligatures under the
+    // engine's own shaper. If it stopped doing so, the assertions below would
+    // pass vacuously, so the test refuses to run on that premise.
+    let font = noto_sans_bytes();
+    for word in ["office", "field", "flow"] {
+        let glyphs = forme::text::shaping::shape_text(word, &font).unwrap();
+        assert!(
+            glyphs.len() < word.chars().count(),
+            "precondition: Noto Sans must ligate {word:?}, got {} glyphs for {} chars",
+            glyphs.len(),
+            word.chars().count()
+        );
+    }
+
+    let text = "office field flow";
+    let cases = [
+        // Single-style Text, single font (shaped_glyphs_to_positioned).
+        (
+            "single-style",
+            format!(r#"{{ "type": "Text", "content": "{text}" }}"#),
+            r#"{ "fontFamily": "Lig", "fontSize": 14 }"#,
+        ),
+        // Single-style Text with a fallback chain (per-font-run path).
+        (
+            "fallback-chain",
+            format!(r#"{{ "type": "Text", "content": "{text}" }}"#),
+            r#"{ "fontFamily": "Lig, Helvetica", "fontSize": 14 }"#,
+        ),
+        // Multi-run Text (shaped_glyphs_to_positioned_runs).
+        (
+            "runs",
+            r##"{ "type": "Text", "content": "", "runs": [
+                { "content": "office ", "style": { "fontFamily": "Lig", "fontSize": 14 } },
+                { "content": "field flow", "style": { "fontFamily": "Lig", "fontSize": 14, "color": { "r": 0.8, "g": 0.0, "b": 0.0, "a": 1.0 } } }
+            ] }"##
+                .to_string(),
+            r#"{ "fontFamily": "Lig", "fontSize": 14 }"#,
+        ),
+    ];
+
+    for (name, kind, style) in cases {
+        let pdf = render_with_ligature_font(&kind, style);
+        let dests = tounicode_destinations(&pdf);
+        assert!(
+            !dests.is_empty(),
+            "{name}: expected a ToUnicode CMap with bfchar entries"
+        );
+        for lig in ["ffi", "fi", "fl"] {
+            assert!(
+                dests.iter().any(|d| d == lig),
+                "{name}: the {lig:?} ligature glyph must map to all of {lig:?} in \
+                 the ToUnicode CMap, or text extraction drops characters \
+                 (\"office\" -> \"ofice\"). Destinations: {dests:?}"
+            );
+        }
+    }
+}

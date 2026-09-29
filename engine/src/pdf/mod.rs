@@ -79,14 +79,48 @@ struct FormFieldData {
 
 pub struct PdfWriter;
 
+/// Record the text `glyph` stands for, for the ToUnicode CMap.
+///
+/// A ligature glyph (one glyph for several chars, `PositionedGlyph::ligature`)
+/// stands for its whole cluster, so "ffi" extracts as "ffi" and not "f"
+/// (issue #156). Every other glyph stands for its own char, which for a glyph
+/// sharing a multi-glyph cluster is the cluster's first char, as before.
+///
+/// One glyph ID has ONE CMap entry, so when the same glyph is seen standing
+/// for different text the choice must be deterministic and must not corrupt
+/// ordinary text. Rule: a single-char mapping beats a multi-char one, and
+/// otherwise the first one seen (document order) wins. A glyph the font maps
+/// from a single char is that char everywhere; a multi-char mapping only
+/// survives for glyphs that are never seen alone, which is what a real
+/// ligature glyph is. Without the rule, a glyph seen once in a cluster such as
+/// "e" + U+FE0F would turn every later plain "e" into "e\u{FE0F}".
+fn record_glyph_text(glyph_to_text: &mut HashMap<u16, String>, glyph: &PositionedGlyph) {
+    let text = match &glyph.cluster_text {
+        Some(cluster) if glyph.ligature && !cluster.is_empty() => cluster.clone(),
+        _ => glyph.char_value.to_string(),
+    };
+    match glyph_to_text.entry(glyph.glyph_id) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(text);
+        }
+        std::collections::hash_map::Entry::Occupied(mut slot) => {
+            let existing_is_multi = slot.get().chars().nth(1).is_some();
+            let new_is_single = text.chars().nth(1).is_none();
+            if existing_is_multi && new_is_single {
+                slot.insert(text);
+            }
+        }
+    }
+}
+
 /// Embedding data for a custom TrueType font.
 #[allow(dead_code)]
 struct CustomFontEmbedData {
     ttf_data: Vec<u8>,
     /// Maps original glyph IDs (from shaping) to remapped GIDs in the subset font.
     gid_remap: HashMap<u16, u16>,
-    /// Maps original glyph IDs to their Unicode character(s) for ToUnicode CMap.
-    glyph_to_char: HashMap<u16, char>,
+    /// Maps original glyph IDs to the text each stands for (ToUnicode CMap).
+    glyph_to_text: HashMap<u16, String>,
     /// Legacy fallback: maps chars to subset GIDs (for page number placeholders).
     char_to_gid: HashMap<char, u16>,
     units_per_em: u16,
@@ -100,8 +134,9 @@ struct FontUsage {
     chars: HashSet<char>,
     /// Glyph IDs used per font (from shaped PositionedGlyphs).
     glyph_ids: HashSet<u16>,
-    /// Maps glyph ID → first char it represents (for ToUnicode CMap).
-    glyph_to_char: HashMap<u16, char>,
+    /// Maps glyph ID → the text it stands for (for ToUnicode CMap): one char
+    /// for an ordinary glyph, the whole cluster for a ligature ("ffi").
+    glyph_to_text: HashMap<u16, String>,
 }
 
 /// Tracks allocated PDF objects during writing.
@@ -3143,14 +3178,14 @@ impl PdfWriter {
                     let usage = font_usage_map.get(key);
                     let used_glyph_ids = usage.map(|u| &u.glyph_ids);
                     let used_chars = usage.map(|u| &u.chars);
-                    let glyph_to_char = usage.map(|u| &u.glyph_to_char);
+                    let glyph_to_text = usage.map(|u| &u.glyph_to_text);
                     let type0_obj_id = Self::write_custom_font_objects(
                         builder,
                         key,
                         data,
                         used_glyph_ids.cloned().unwrap_or_default(),
                         used_chars.cloned().unwrap_or_default(),
-                        glyph_to_char.cloned().unwrap_or_default(),
+                        glyph_to_text.cloned().unwrap_or_default(),
                     )?;
                     builder.font_objects.push((key.clone(), type0_obj_id));
                 }
@@ -3184,7 +3219,7 @@ impl PdfWriter {
                         let usage = font_usage.entry(key).or_insert_with(|| FontUsage {
                             chars: HashSet::new(),
                             glyph_ids: HashSet::new(),
-                            glyph_to_char: HashMap::new(),
+                            glyph_to_text: HashMap::new(),
                         });
                         usage.chars.insert(glyph.char_value);
                         // A page-number sentinel becomes digits at write
@@ -3197,21 +3232,7 @@ impl PdfWriter {
                             usage.chars.extend('0'..='9');
                         }
                         usage.glyph_ids.insert(glyph.glyph_id);
-                        // For ligatures, use the first char of the cluster
-                        usage
-                            .glyph_to_char
-                            .entry(glyph.glyph_id)
-                            .or_insert(glyph.char_value);
-                        // If there's cluster_text, record all chars for this glyph
-                        if let Some(ref ct) = glyph.cluster_text {
-                            // First char already recorded above; cluster_text is for ToUnicode
-                            if let Some(first_char) = ct.chars().next() {
-                                usage
-                                    .glyph_to_char
-                                    .entry(glyph.glyph_id)
-                                    .or_insert(first_char);
-                            }
-                        }
+                        record_glyph_text(&mut usage.glyph_to_text, glyph);
                     }
                 }
             }
@@ -3811,14 +3832,14 @@ impl PdfWriter {
     ///
     /// `used_glyph_ids`: original glyph IDs from shaping (from PositionedGlyph.glyph_id).
     /// `used_chars`: characters used (for char→gid fallback, e.g., page number placeholders).
-    /// `glyph_to_char_map`: maps original glyph ID → first Unicode char (for ToUnicode CMap).
+    /// `glyph_to_text_map`: maps original glyph ID → the text it stands for (for ToUnicode CMap).
     fn write_custom_font_objects(
         builder: &mut PdfBuilder,
         key: &FontKey,
         ttf_data: &[u8],
         used_glyph_ids: HashSet<u16>,
         used_chars: HashSet<char>,
-        glyph_to_char_map: HashMap<u16, char>,
+        glyph_to_text_map: HashMap<u16, String>,
     ) -> Result<usize, FormeError> {
         let face = ttf_parser::Face::parse(ttf_data, 0).map_err(|e| {
             FormeError::FontError(format!(
@@ -3867,17 +3888,21 @@ impl PdfWriter {
         // Build glyph_id→new_gid mapping (for shaped content stream)
         let gid_remap_for_embed = gid_remap.clone();
 
-        // Build new_gid→char mapping for ToUnicode CMap
-        let mut new_gid_to_char: HashMap<u16, char> = HashMap::new();
-        // From shaped glyph→char mapping
-        for (&orig_gid, &ch) in &glyph_to_char_map {
-            if let Some(&new_gid) = gid_remap.get(&orig_gid) {
-                new_gid_to_char.entry(new_gid).or_insert(ch);
+        // Build new_gid→text mapping for ToUnicode CMap
+        let mut new_gid_to_text: HashMap<u16, String> = HashMap::new();
+        // From shaped glyph→text mapping
+        for (orig_gid, text) in &glyph_to_text_map {
+            if let Some(&new_gid) = gid_remap.get(orig_gid) {
+                new_gid_to_text
+                    .entry(new_gid)
+                    .or_insert_with(|| text.clone());
             }
         }
         // Fill in from char→gid mapping too
         for (&ch, &new_gid) in &char_to_gid {
-            new_gid_to_char.entry(new_gid).or_insert(ch);
+            new_gid_to_text
+                .entry(new_gid)
+                .or_insert_with(|| ch.to_string());
         }
 
         let pdf_font_name = Self::sanitize_font_name(&key.family, key.weight, key.italic);
@@ -3961,7 +3986,7 @@ impl PdfWriter {
 
         // 4. ToUnicode CMap
         let tounicode_id = builder.objects.len();
-        let cmap_content = Self::build_tounicode_cmap_from_gids(&new_gid_to_char, &pdf_font_name);
+        let cmap_content = Self::build_tounicode_cmap_from_gids(&new_gid_to_text, &pdf_font_name);
         let compressed_cmap = compress_to_vec_zlib(cmap_content.as_bytes(), 6);
         let mut tounicode_data: Vec<u8> = Vec::new();
         let _ = write!(
@@ -3996,7 +4021,7 @@ impl PdfWriter {
             CustomFontEmbedData {
                 ttf_data: embed_ttf,
                 gid_remap: gid_remap_for_embed,
-                glyph_to_char: glyph_to_char_map,
+                glyph_to_text: glyph_to_text_map,
                 char_to_gid,
                 units_per_em,
                 ascender,
@@ -4041,11 +4066,26 @@ impl PdfWriter {
         result
     }
 
-    /// Build a ToUnicode CMap from new_gid → char mapping.
-    fn build_tounicode_cmap_from_gids(gid_to_char: &HashMap<u16, char>, font_name: &str) -> String {
-        let mut gid_to_unicode: Vec<(u16, u32)> = gid_to_char
+    /// Build a ToUnicode CMap from new_gid → text mapping.
+    ///
+    /// Each destination is the text's UTF-16BE code units, so a ligature
+    /// glyph maps to every char it stands for (`<0005> <006600660069>` for
+    /// "ffi") and a non-BMP char is written as its surrogate pair, both as
+    /// the PDF spec defines bfchar destinations (ISO 32000-1, 9.10.3).
+    fn build_tounicode_cmap_from_gids(
+        gid_to_text: &HashMap<u16, String>,
+        font_name: &str,
+    ) -> String {
+        let mut gid_to_unicode: Vec<(u16, String)> = gid_to_text
             .iter()
-            .map(|(&gid, &ch)| (gid, ch as u32))
+            .filter(|(_, text)| !text.is_empty())
+            .map(|(&gid, text)| {
+                let hex: String = text
+                    .encode_utf16()
+                    .map(|unit| format!("{:04X}", unit))
+                    .collect();
+                (gid, hex)
+            })
             .collect();
         gid_to_unicode.sort_by_key(|(gid, _)| *gid);
 
@@ -4067,8 +4107,8 @@ impl PdfWriter {
         // PDF spec limits beginbfchar to 100 entries per block
         for chunk in gid_to_unicode.chunks(100) {
             let _ = writeln!(cmap, "{} beginbfchar", chunk.len());
-            for &(gid, unicode) in chunk {
-                let _ = writeln!(cmap, "<{:04X}> <{:04X}>", gid, unicode);
+            for (gid, unicode) in chunk {
+                let _ = writeln!(cmap, "<{:04X}> <{}>", gid, unicode);
             }
             let _ = writeln!(cmap, "endbfchar");
         }
@@ -4987,6 +5027,7 @@ mod tests {
                                 text_decoration: TextDecoration::None,
                                 letter_spacing: 0.0,
                                 cluster_text: None,
+                                ligature: false,
                             }],
                             word_spacing: 0.0,
                         }],
@@ -5034,6 +5075,7 @@ mod tests {
                                 text_decoration: TextDecoration::None,
                                 letter_spacing: 0.0,
                                 cluster_text: None,
+                                ligature: false,
                             }],
                             word_spacing: 0.0,
                         }],
@@ -5120,10 +5162,10 @@ mod tests {
 
     #[test]
     fn test_tounicode_cmap_format() {
-        // glyph_to_char: maps subset glyph IDs → Unicode chars
+        // glyph_to_text: maps subset glyph IDs → Unicode text
         let mut glyph_to_char = HashMap::new();
-        glyph_to_char.insert(36u16, 'A');
-        glyph_to_char.insert(37u16, 'B');
+        glyph_to_char.insert(36u16, "A".to_string());
+        glyph_to_char.insert(37u16, "B".to_string());
 
         let cmap = PdfWriter::build_tounicode_cmap_from_gids(&glyph_to_char, "TestFont");
 
@@ -5150,6 +5192,94 @@ mod tests {
             cmap.contains("<0000> <FFFF>"),
             "Codespace should be 0000-FFFF"
         );
+    }
+
+    /// Issue #156: a ligature destination carries every char, and a non-BMP
+    /// char is written as its UTF-16 surrogate pair. The old writer emitted
+    /// `{:04X}` of the code point, which for U+1F600 is the odd-length and
+    /// invalid `<1F600>`.
+    #[test]
+    fn test_tounicode_cmap_multi_char_and_non_bmp_destinations() {
+        let mut gid_to_text = HashMap::new();
+        gid_to_text.insert(5u16, "ffi".to_string());
+        gid_to_text.insert(6u16, "Th".to_string());
+        gid_to_text.insert(7u16, "\u{1F600}".to_string());
+
+        let cmap = PdfWriter::build_tounicode_cmap_from_gids(&gid_to_text, "TestFont");
+
+        assert!(cmap.contains("<0005> <006600660069>"), "{cmap}");
+        assert!(cmap.contains("<0006> <00540068>"), "{cmap}");
+        assert!(cmap.contains("<0007> <D83DDE00>"), "{cmap}");
+    }
+
+    fn text_glyph(
+        glyph_id: u16,
+        ch: char,
+        cluster: Option<&str>,
+        ligature: bool,
+    ) -> PositionedGlyph {
+        PositionedGlyph {
+            glyph_id,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            x_advance: 5.0,
+            font_size: 12.0,
+            font_family: "Lig".into(),
+            font_weight: 400,
+            font_style: FontStyle::Normal,
+            char_value: ch,
+            color: None,
+            href: None,
+            text_decoration: TextDecoration::None,
+            letter_spacing: 0.0,
+            cluster_text: cluster.map(str::to_string),
+            ligature,
+        }
+    }
+
+    #[test]
+    fn test_record_glyph_text_ligature_maps_whole_cluster() {
+        let mut map = HashMap::new();
+        record_glyph_text(&mut map, &text_glyph(9, 'f', Some("ffi"), true));
+        assert_eq!(map[&9], "ffi");
+    }
+
+    /// A glyph that shares a multi-glyph cluster is NOT a ligature: it keeps
+    /// its own char even though it carries the cluster text, so a shared
+    /// mark or matra glyph never claims one particular base.
+    #[test]
+    fn test_record_glyph_text_shared_cluster_glyph_keeps_its_char() {
+        let mut map = HashMap::new();
+        record_glyph_text(&mut map, &text_glyph(9, 'k', Some("ki"), false));
+        assert_eq!(map[&9], "k");
+    }
+
+    /// One glyph, two meanings: the single-char meaning wins whichever order
+    /// they are seen in, so a glyph that swallowed a following ignorable char
+    /// once cannot corrupt every other occurrence of that char.
+    #[test]
+    fn test_record_glyph_text_single_char_beats_multi_char() {
+        let mut first_multi = HashMap::new();
+        record_glyph_text(
+            &mut first_multi,
+            &text_glyph(9, 'e', Some("e\u{FE0F}"), true),
+        );
+        record_glyph_text(&mut first_multi, &text_glyph(9, 'e', None, false));
+        assert_eq!(first_multi[&9], "e");
+
+        let mut first_single = HashMap::new();
+        record_glyph_text(&mut first_single, &text_glyph(9, 'e', None, false));
+        record_glyph_text(
+            &mut first_single,
+            &text_glyph(9, 'e', Some("e\u{FE0F}"), true),
+        );
+        assert_eq!(first_single[&9], "e");
+
+        // Between two multi-char meanings, the first one seen stays.
+        let mut two_multi = HashMap::new();
+        record_glyph_text(&mut two_multi, &text_glyph(9, 'f', Some("fi"), true));
+        record_glyph_text(&mut two_multi, &text_glyph(9, 'f', Some("ffi"), true));
+        assert_eq!(two_multi[&9], "fi");
     }
 
     #[test]
@@ -5210,6 +5340,7 @@ mod tests {
                             text_decoration: TextDecoration::None,
                             letter_spacing: 0.0,
                             cluster_text: None,
+                            ligature: false,
                         }],
                         word_spacing: 0.0,
                     }],
