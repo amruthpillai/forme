@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { parseColor } from '../src/index.js';
 import { parseMarkup } from '../src/parser.js';
 
@@ -1274,5 +1274,34 @@ describe('errors', () => {
     expect(() => parseIn('<forme-text props="{oops">x</forme-text>')).toThrow(
       /\[Forme\] <Text>: failed to decode props/
     );
+  });
+});
+
+describe('list children that are not ListItems (issue #161)', () => {
+  it('drops a stray element with a warning naming it', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const doc = parseIn(
+        `<forme-unordered-list props="{}"><forme-list-item props="{}">a</forme-list-item>`
+        + `<forme-view props="{}"></forme-view></forme-unordered-list>`,
+      );
+      expect((doc.children[0] as { children: unknown[] }).children).toHaveLength(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).toMatch(/<UnorderedList> dropped <View>/);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('drops whitespace and comment anchors without a warning', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      parseIn(
+        `<forme-ordered-list props="{}">\n  <!--[--><forme-list-item props="{}">a</forme-list-item><!--]-->\n</forme-ordered-list>`,
+      );
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

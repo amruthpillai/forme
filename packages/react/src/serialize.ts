@@ -614,6 +614,12 @@ interface SerializerCtx {
   flatten: (children: unknown) => unknown[];
   /** `flatten`, then user components replaced by their flattened results. */
   nodeChildren: (children: unknown) => unknown[];
+  /**
+   * A value that is not an element but serializes to nodes on this path:
+   * the template proxy's `.map()` and expression markers. The main path has
+   * none (a real `.map()` there is already an array of elements).
+   */
+  isMarker: (c: unknown) => boolean;
   style: (style?: Style) => Record<string, unknown>;
   /** Plain text content — a string, or a `$ref` marker on the template path. */
   textContent: (children: unknown) => unknown;
@@ -628,6 +634,7 @@ interface SerializerCtx {
 const MAIN_CTX: SerializerCtx = {
   flatten: (c) => flattenChildren(c),
   nodeChildren: (c) => expandComponents(flattenChildren(c), flattenChildren),
+  isMarker: () => false,
   style: (s) => mapStyle(s) as Record<string, unknown>,
   textContent: (c) => flattenTextContent(c),
   isRunChild: (c) => inlineDefaults(c.type) !== null,
@@ -639,6 +646,7 @@ const MAIN_CTX: SerializerCtx = {
 const TEMPLATE_CTX: SerializerCtx = {
   flatten: (c) => flattenTemplateChildren(c),
   nodeChildren: (c) => expandComponents(flattenTemplateChildren(c), flattenTemplateChildren),
+  isMarker: (c) => isEachMarker(c) || isExprMarker(c),
   style: (s) => mapTemplateStyle(s),
   textContent: (c) => flattenTemplateTextContent(c),
   // The template path's own convention for Text, kept exactly: a nested
@@ -710,13 +718,30 @@ function buildList(
 
   const start = typeof props.start === 'number' && props.start >= 1 ? props.start : 1;
 
-  // Children must be ListItems — anything else is silently dropped to
-  // keep the serializer tolerant. (We don't throw on stray content because
-  // a Fragment / null child in JSX is too common to be a real error.)
-  const childElements = ctx.flatten(props.children).filter(
-    (c) => isValidElement(c as ReactElement) && (c as ReactElement).type === ListItem,
-  ) as ReactElement[];
-  const children = childElements.map((c) => buildListItem(c, ctx));
+  // Children must be ListItems. User components are expanded first, so one
+  // that returns ListItems counts as ListItems. On the template path a
+  // `.map()` or expression marker stands for the ListItems it will produce
+  // once data is bound: it is serialized and kept when every node it can
+  // produce is a ListItem (issue #161: this filter used to drop the marker,
+  // and with it the whole list). Null, booleans and whitespace are dropped
+  // quietly as JSX noise; anything else is dropped with a warning, because
+  // the engine only lays out ListItems here.
+  const listName = ordered ? 'OrderedList' : 'UnorderedList';
+  const children: unknown[] = [];
+  for (const c of ctx.nodeChildren(props.children)) {
+    if (isValidElement(c as ReactElement) && (c as ReactElement).type === ListItem) {
+      children.push(buildListItem(c as ReactElement, ctx));
+    } else if (ctx.isMarker(c)) {
+      const node = ctx.child(c as ReactElement, null);
+      if (node !== null && producesOnlyListItems(node)) {
+        children.push(node);
+      } else if (node !== null) {
+        warnDroppedListChild(listName, 'a .map() or expression that does not produce <ListItem>s');
+      }
+    } else if (!isJsxNoise(c)) {
+      warnDroppedListChild(listName, describeChild(c));
+    }
+  }
 
   const node: Record<string, unknown> = {
     kind: { type: 'List', ordered, marker_type: markerType, start },
@@ -746,7 +771,9 @@ function buildListItem(element: ReactElement, ctx: SerializerCtx): Record<string
         style: {},
         children: [],
       });
-    } else if (isValidElement(c as ReactElement)) {
+    } else if (isValidElement(c as ReactElement) || ctx.isMarker(c)) {
+      // A marker here is a `.map()` or expression inside the item itself,
+      // e.g. a nested list's items or a run of <Text>s from data.
       const node = ctx.child(c as ReactElement, null);
       if (node) children.push(node);
     }
@@ -759,6 +786,54 @@ function buildListItem(element: ReactElement, ctx: SerializerCtx): Record<string
   const loc = ctx.sourceLocation(element);
   if (loc !== undefined) node.sourceLocation = loc;
   return node;
+}
+
+/**
+ * Does every node this serialized value can produce have kind ListItem?
+ * A plain node answers for itself; an `$each` or expression node answers for
+ * the node values it holds (its template, its branches), since those are
+ * what it becomes once data is bound.
+ */
+function producesOnlyListItems(value: unknown): boolean {
+  if (value === null || typeof value !== 'object') return true;
+  const obj = value as Record<string, unknown>;
+  const kind = obj.kind as { type?: unknown } | undefined;
+  if (kind && typeof kind === 'object' && 'type' in kind) return kind.type === 'ListItem';
+  return Object.values(obj).every((v) =>
+    Array.isArray(v) ? v.every(producesOnlyListItems) : producesOnlyListItems(v),
+  );
+}
+
+/** Null, booleans and whitespace-only text: the gaps between JSX children. */
+function isJsxNoise(c: unknown): boolean {
+  return c === null || c === undefined || typeof c === 'boolean'
+    || (typeof c === 'string' && c.trim() === '');
+}
+
+function describeChild(c: unknown): string {
+  if (isValidElement(c as ReactElement)) {
+    const type = (c as ReactElement).type as unknown;
+    const name = typeof type === 'string'
+      ? type
+      : ((type as { displayName?: string; name?: string } | null)?.displayName
+        || (type as { name?: string } | null)?.name
+        || 'element');
+    return `<${name}>`;
+  }
+  if (typeof c === 'string' || typeof c === 'number') return `text ${JSON.stringify(String(c))}`;
+  return typeof c;
+}
+
+/**
+ * The serializer has no warnings channel of its own (render `warnings` come
+ * from the engine, which never sees what was dropped here), so a dropped
+ * list child is reported the way the deprecated `signature` prop is.
+ */
+function warnDroppedListChild(listName: string, what: string): void {
+  console.warn(
+    `[Forme] <${listName}> dropped ${what}: only <ListItem> children are rendered in a list. `
+    + `Wrap the content in <ListItem>.`,
+  );
 }
 
 function serializeHeading(element: ReactElement, level: 1 | 2 | 3 | 4 | 5 | 6): FormeNode {
