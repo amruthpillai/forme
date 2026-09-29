@@ -59,6 +59,15 @@ struct LinkAnnotation {
     href: String,
 }
 
+/// A linked span inside one text line: the glyphs of an inline link run
+/// (`<Text>See <Link href>docs</Link></Text>`) that share an href, with the
+/// absolute x extent they are drawn at.
+struct InlineLinkSpan {
+    href: String,
+    x0: f64,
+    x1: f64,
+}
+
 /// A bookmark entry for the PDF outline tree.
 struct PdfBookmark {
     title: String,
@@ -1548,6 +1557,22 @@ impl PdfWriter {
                     // structure destination under UA-2 (ISO 14289-2 8.8).
                     if let Some(ref bm) = element.bookmark {
                         tb.note_bookmark(bm);
+                    }
+                    // Inline links (a linked run inside a paragraph) get a
+                    // /Link structure element each, under this line's
+                    // element, so their annotations can attach to it like
+                    // element-level links do. Same gate as
+                    // `collect_link_annotations`: only when neither this
+                    // element nor an ancestor carries an href, since those
+                    // annotations already cover the whole box.
+                    if href.is_none() && !tb.inside_link() {
+                        if let DrawCommand::Text { ref lines, .. } = element.draw {
+                            for line in lines {
+                                for span in Self::inline_link_spans(line) {
+                                    tb.add_inline_link(page_idx, &span.href);
+                                }
+                            }
+                        }
                     }
                     match mcid {
                         Some(mcid) => {
@@ -4217,8 +4242,90 @@ impl PdfWriter {
                     continue;
                 }
             }
+            // Inline links: a linked run inside a paragraph lives only on its
+            // glyphs (`PositionedGlyph.href`), never on an element, so each
+            // contiguous linked span gets its own annotation per line. A span
+            // that wraps yields one rect per line it touches.
+            if let DrawCommand::Text { ref lines, .. } = element.draw {
+                for line in lines {
+                    let spans = Self::inline_link_spans(line);
+                    if spans.is_empty() {
+                        continue;
+                    }
+                    // Layout emits one TextLine element per line, whose box
+                    // IS the line box. A multi-line Text command has no
+                    // per-line box, so estimate it around the baseline.
+                    let (top, height) = if lines.len() == 1 {
+                        (element.y, element.height)
+                    } else {
+                        let fs = line.glyphs.first().map(|g| g.font_size).unwrap_or(12.0);
+                        (line.y - fs * 0.8 - (line.height - fs) / 2.0, line.height)
+                    };
+                    for span in spans {
+                        annotations.push(LinkAnnotation {
+                            x: span.x0,
+                            y: page_height - top - height,
+                            width: span.x1 - span.x0,
+                            height,
+                            href: span.href,
+                        });
+                    }
+                }
+            }
             Self::collect_link_annotations(&element.children, page_height, annotations);
         }
+    }
+
+    /// Contiguous runs of glyphs on one line that share a per-glyph href,
+    /// with the x extent they are actually drawn at. Positions mirror the
+    /// text writer (style groups placed at `x_cursor`, `Tw` added per space)
+    /// so the annotation lands on the ink, justified lines included.
+    fn inline_link_spans(line: &TextLine) -> Vec<InlineLinkSpan> {
+        let mut spans: Vec<InlineLinkSpan> = Vec::new();
+        if !line.glyphs.iter().any(|g| g.href.is_some()) {
+            return spans;
+        }
+        let mut x_cursor = line.x;
+        let mut prev_href: Option<&str> = None;
+        for group in Self::group_glyphs_by_style(&line.glyphs) {
+            let first = group[0];
+            let mut spaces = 0usize;
+            for g in &group {
+                let x0 =
+                    x_cursor + (g.x_offset - first.x_offset) + spaces as f64 * line.word_spacing;
+                let x1 = x0 + g.x_advance;
+                if g.char_value == ' ' {
+                    spaces += 1;
+                }
+                let href = g.href.as_deref().filter(|h| !h.is_empty());
+                if let Some(h) = href {
+                    if prev_href != Some(h) {
+                        spans.push(InlineLinkSpan {
+                            href: h.to_string(),
+                            x0: f64::INFINITY,
+                            x1: f64::NEG_INFINITY,
+                        });
+                    }
+                    // Only ink extends the rect: a space at a span's edge
+                    // (the one a wrapped line ends on, or "docs " in the
+                    // source) would widen the target past the text.
+                    if !g.char_value.is_whitespace() {
+                        if let Some(last) = spans.last_mut() {
+                            last.x0 = last.x0.min(x0);
+                            last.x1 = last.x1.max(x1);
+                        }
+                    }
+                }
+                prev_href = href;
+            }
+            if let Some(last) = group.last() {
+                x_cursor =
+                    line.x + last.x_offset + last.x_advance + spaces as f64 * line.word_spacing;
+            }
+        }
+        // A span of nothing but spaces has no ink to link.
+        spans.retain(|s| s.x1 > s.x0);
+        spans
     }
 
     /// Collect form field annotations from layout elements.

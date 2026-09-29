@@ -315,6 +315,44 @@ impl TagBuilder {
         mcid
     }
 
+    /// True when an open ancestor (or the current element) is a /Link, i.e.
+    /// carries an element-level href. Its annotation covers the whole box,
+    /// so inline links inside it get no annotation or structure of their own.
+    pub fn inside_link(&self) -> bool {
+        self.parent_stack
+            .iter()
+            .any(|&idx| self.elements[idx].role == "Link")
+    }
+
+    /// Add a /Link structure element for an inline link (a linked run inside
+    /// a paragraph) as a child of the currently open element, and record a
+    /// link slot so the annotation pass attaches the annotation to it (OBJR +
+    /// /StructParent, PDF/UA 7.18.5-1). The link's text stays in the line's
+    /// own marked content: moving it inside the /Link would mean splitting
+    /// the line's marked-content sequence per run.
+    pub fn add_inline_link(&mut self, page_idx: usize, href: &str) {
+        let parent_idx = *self.parent_stack.last().unwrap_or(&0);
+        let elem_idx = self.elements.len();
+        self.elements.push(StructElement {
+            role: "Link",
+            parent_idx,
+            kids: Vec::new(),
+            alt: None,
+            col_span: 1,
+            list_numbering: None,
+            actual_text: None,
+        });
+        self.elements[parent_idx]
+            .kids
+            .push(StructKid::StructRef(elem_idx));
+        self.link_slots.push(LinkSlot {
+            page_idx,
+            elem_idx,
+            href: href.to_string(),
+            matched: false,
+        });
+    }
+
     /// Attach a link annotation to its /Link structure element: add an OBJR
     /// kid pointing at the annotation, and allocate a StructParent number that
     /// the ParentTree maps back to the /Link element. Returns the number to
