@@ -14275,3 +14275,172 @@ fn a_flex_item_margin_is_free_space_a_grow_sibling_cannot_take() {
         grower.width
     );
 }
+
+// ── DocInfo text strings + Producer parity (issue #158) ─────────────────
+
+/// Decode the PDF string token that follows `key` in `haystack` as a PDF
+/// text string (ISO 32000-1 7.9.2.2). A `<FEFF...>` hex string is UTF-16BE
+/// with a BOM; a `(...)` literal is read byte-per-char, which agrees with
+/// PDFDocEncoding for the printable ASCII these tests put there. Returns
+/// the text and whether it came from a UTF-16BE hex string.
+fn decode_text_string_after(haystack: &[u8], key: &str) -> Option<(String, bool)> {
+    let pos = haystack
+        .windows(key.len())
+        .position(|w| w == key.as_bytes())?;
+    let mut rest = &haystack[pos + key.len()..];
+    while rest.first() == Some(&b' ') {
+        rest = &rest[1..];
+    }
+    match rest.first()? {
+        b'<' => {
+            let end = rest.iter().position(|&b| b == b'>')?;
+            let hex = std::str::from_utf8(&rest[1..end]).ok()?;
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            assert_eq!(
+                &bytes[..2],
+                &[0xFE, 0xFF],
+                "a hex text string must start with the UTF-16BE BOM"
+            );
+            let units: Vec<u16> = bytes[2..]
+                .chunks(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect();
+            Some((String::from_utf16(&units).ok()?, true))
+        }
+        b'(' => {
+            let mut out = String::new();
+            let mut i = 1;
+            while rest[i] != b')' {
+                if rest[i] == b'\\' {
+                    i += 1;
+                }
+                out.push(rest[i] as char);
+                i += 1;
+            }
+            Some((out, false))
+        }
+        _ => None,
+    }
+}
+
+/// The bytes of the /Info object: the dictionary carrying /Producer.
+fn info_dict_bytes(bytes: &[u8]) -> &[u8] {
+    let p = bytes
+        .windows(9)
+        .position(|w| w == b"/Producer")
+        .expect("an /Info dictionary with /Producer");
+    let start = bytes[..p]
+        .windows(3)
+        .rposition(|w| w == b"obj")
+        .expect("object header before /Producer");
+    let end = p + bytes[p..]
+        .windows(6)
+        .position(|w| w == b"endobj")
+        .expect("endobj after /Producer");
+    &bytes[start..end]
+}
+
+#[test]
+fn docinfo_non_ascii_text_is_utf16be_with_bom() {
+    // Issue #158: /Title was raw UTF-8 inside a literal string, which every
+    // reader decodes as PDFDocEncoding, so "Übertragungsurkunde" showed as
+    // "Ãœbertragungsurkunde". A text string that is not plain ASCII must be
+    // UTF-16BE with a BOM. The clef (U+1D11E) is outside the BMP and so
+    // exercises the surrogate pair.
+    let title = "Übertragungsurkunde";
+    let author = "Zoë Brontë 𝄞";
+    let subject = "Größe (Ω)";
+    let json = format!(
+        r#"{{ "children": [ {{ "kind": {{ "type": "Text", "content": "Hello" }}, "style": {{}}, "children": [] }} ],
+            "metadata": {{ "title": "{title}", "author": "{author}", "subject": "{subject}" }} }}"#
+    );
+    let bytes = forme::render_json(&json).expect("renders");
+    let info = info_dict_bytes(&bytes);
+    for (key, want) in [
+        ("/Title", title),
+        ("/Author", author),
+        ("/Subject", subject),
+    ] {
+        let (got, hex) = decode_text_string_after(info, key)
+            .unwrap_or_else(|| panic!("{key} missing from /Info"));
+        assert!(
+            hex,
+            "{key} must be a <FEFF...> UTF-16BE string, got the literal {got:?}"
+        );
+        assert_eq!(got, want, "{key} must decode back to the input");
+    }
+    assert!(
+        !info.windows(2).any(|w| w == "Ü".as_bytes()),
+        "no raw UTF-8 may remain in /Info"
+    );
+}
+
+#[test]
+fn docinfo_ascii_text_stays_an_escaped_literal() {
+    // Plain printable ASCII keeps the literal form it always had, with the
+    // string delimiters escaped, so ASCII-only output is unchanged.
+    let json = r#"{ "children": [ { "kind": { "type": "Text", "content": "Hello" }, "style": {}, "children": [] } ],
+        "metadata": { "title": "Report (Q3) \\ final" } }"#;
+    let bytes = forme::render_json(json).expect("renders");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains(r"/Title (Report \(Q3\) \\ final)"),
+        "an ASCII title must stay an escaped literal"
+    );
+}
+
+#[test]
+fn outline_non_ascii_title_is_utf16be_with_bom() {
+    // An outline item's /Title is a text string too (ISO 32000-1 Table 153)
+    // and went through the same raw-UTF-8 path.
+    let json = r#"{ "children": [
+        { "kind": { "type": "Text", "content": "Kapitel" }, "bookmark": "Übersicht", "style": {}, "children": [] }
+    ], "metadata": {} }"#;
+    let bytes = forme::render_json(json).expect("renders");
+    let (got, hex) = decode_text_string_after(&bytes, "/Title").expect("an outline item /Title");
+    assert!(hex, "a non-ASCII outline title must be a <FEFF...> string");
+    assert_eq!(got, "Übersicht");
+}
+
+#[test]
+fn docinfo_producer_and_creator_match_xmp() {
+    // Issue #158: DocInfo said /Producer (Forme 0.6) while the XMP said
+    // pdf:Producer "Forme". PDF/A requires each DocInfo entry to agree with
+    // its XMP counterpart, and veraPDF does not check this pair, so it is
+    // asserted here. /Creator pairs with xmp:CreatorTool, /Title with
+    // dc:title.
+    let json = r#"{ "children": [ { "kind": { "type": "Text", "content": "Hello" }, "style": { "fontFamily": "Noto Sans" }, "children": [] } ],
+        "metadata": { "title": "Übertragungsurkunde" }, "pdfa": "2b" }"#;
+    let bytes = forme::render_json(json).expect("PDF/A-2b renders");
+    let info = info_dict_bytes(&bytes);
+    let text = String::from_utf8_lossy(&bytes);
+    let xmp_value = |open: &str| -> String {
+        let s = text
+            .find(open)
+            .unwrap_or_else(|| panic!("XMP {open} missing"))
+            + open.len();
+        let e = s + text[s..].find('<').unwrap();
+        text[s..e].to_string()
+    };
+    let (producer, _) = decode_text_string_after(info, "/Producer").unwrap();
+    assert_eq!(
+        producer,
+        xmp_value("<pdf:Producer>"),
+        "/Producer must equal pdf:Producer"
+    );
+    let (creator, _) = decode_text_string_after(info, "/Creator").unwrap();
+    assert_eq!(
+        creator,
+        xmp_value("<xmp:CreatorTool>"),
+        "/Creator must equal xmp:CreatorTool"
+    );
+    let (title, _) = decode_text_string_after(info, "/Title").unwrap();
+    assert_eq!(
+        title,
+        xmp_value(r#"<rdf:li xml:lang="x-default">"#),
+        "/Title must equal dc:title"
+    );
+}

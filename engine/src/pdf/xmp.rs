@@ -206,8 +206,8 @@ pub fn generate_xmp(
           <rdf:li>{creator}</rdf:li>
         </rdf:Seq>
       </dc:creator>
-      <xmp:CreatorTool>Forme</xmp:CreatorTool>
-      <pdf:Producer>Forme</pdf:Producer>
+      <xmp:CreatorTool>{creator_tool}</xmp:CreatorTool>
+      <pdf:Producer>{producer}</pdf:Producer>
 {entries}    </rdf:Description>
   </rdf:RDF>
 </x:xmpmeta>
@@ -215,6 +215,8 @@ pub fn generate_xmp(
         ns = ns_str,
         title = xml_escape(title),
         creator = xml_escape(creator),
+        creator_tool = xml_escape(super::CREATOR_TOOL),
+        producer = xml_escape(super::PRODUCER),
         entries = entries,
     )
 }

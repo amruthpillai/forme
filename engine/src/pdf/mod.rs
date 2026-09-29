@@ -50,6 +50,21 @@ use miniz_oxide::deflate::compress_to_vec_zlib;
 /// gated on it in CI). Callers wanting a real date pass `modDate`.
 const DEFAULT_ATTACHMENT_MOD_DATE: &str = "D:20000101000000Z";
 
+/// The producer name, written to BOTH DocInfo `/Producer` and XMP
+/// `pdf:Producer` (and the redaction rewrite of each). One definition,
+/// because PDF/A requires the two to agree and veraPDF does not check this
+/// pair (issue #158: DocInfo said "Forme 0.6" while XMP said "Forme").
+///
+/// Deliberately carries no version. A version here would change every
+/// output byte on every release, breaking byte-identity comparisons across
+/// versions for no rendering change, and a hardcoded one goes stale (which
+/// is how "0.6" outlived 0.6 by nineteen releases).
+pub(crate) const PRODUCER: &str = "Forme";
+
+/// The creating tool, written to DocInfo `/Creator` and XMP
+/// `xmp:CreatorTool`, which PDF/A pairs the same way.
+pub(crate) const CREATOR_TOOL: &str = "Forme";
+
 /// A link annotation to be added to a page.
 struct LinkAnnotation {
     x: f64,
@@ -1403,15 +1418,20 @@ impl PdfWriter {
             let id = builder.objects.len();
             let mut info = String::from("<< ");
             if let Some(ref title) = metadata.title {
-                let _ = write!(info, "/Title ({}) ", Self::escape_pdf_string(title));
+                let _ = write!(info, "/Title {} ", Self::encode_text_string(title));
             }
             if let Some(ref author) = metadata.author {
-                let _ = write!(info, "/Author ({}) ", Self::escape_pdf_string(author));
+                let _ = write!(info, "/Author {} ", Self::encode_text_string(author));
             }
             if let Some(ref subject) = metadata.subject {
-                let _ = write!(info, "/Subject ({}) ", Self::escape_pdf_string(subject));
+                let _ = write!(info, "/Subject {} ", Self::encode_text_string(subject));
             }
-            let _ = write!(info, "/Producer (Forme 0.6) /Creator (Forme) >>");
+            let _ = write!(
+                info,
+                "/Producer {} /Creator {} >>",
+                Self::encode_text_string(PRODUCER),
+                Self::encode_text_string(CREATOR_TOOL)
+            );
             builder.objects.push(PdfObject {
                 id,
                 data: info.into_bytes(),
@@ -4313,8 +4333,8 @@ impl PdfWriter {
                 format!("/Dest [{} 0 R /XYZ 0 {:.2} null]", bm.page_obj_id, bm.y_pdf)
             };
             let mut dict = format!(
-                "<< /Title ({}) /Parent {} 0 R {}",
-                Self::escape_pdf_string(&bm.title),
+                "<< /Title {} /Parent {} 0 R {}",
+                Self::encode_text_string(&bm.title),
                 outlines_id,
                 dest,
             );
@@ -4416,6 +4436,31 @@ impl PdfWriter {
         s.replace('\\', "\\\\")
             .replace('(', "\\(")
             .replace(')', "\\)")
+    }
+
+    /// Encode a PDF *text string* (ISO 32000-1 7.9.2.2), delimiters
+    /// included. A text string is PDFDocEncoding or UTF-16BE with a BOM;
+    /// raw UTF-8 in a literal is neither, and readers decode it as
+    /// PDFDocEncoding ("Ü" shows as "Ãœ", issue #158).
+    ///
+    /// Printable ASCII (0x20..=0x7E) is identical in PDFDocEncoding, so it
+    /// stays an escaped literal, byte-for-byte what was written before.
+    /// Anything else becomes `<FEFF...>`: UTF-16BE hex with the BOM, with
+    /// surrogate pairs outside the BMP. PDFDocEncoding's Latin-1 range would
+    /// cover some non-ASCII text too, but it differs from Latin-1 in
+    /// 0x7F..=0xA0 and cannot express most scripts, so one rule that is
+    /// always correct beats a second table to keep right.
+    pub(crate) fn encode_text_string(s: &str) -> String {
+        if s.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+            return format!("({})", Self::escape_pdf_string(s));
+        }
+        let mut out = String::with_capacity(6 + s.len() * 4);
+        out.push_str("<FEFF");
+        for unit in s.encode_utf16() {
+            let _ = write!(out, "{unit:04X}");
+        }
+        out.push('>');
+        out
     }
 
     /// Decode an attachment `src`: plain base64, with an optional
@@ -4868,6 +4913,19 @@ mod tests {
             "Hello \\(World\\)"
         );
         assert_eq!(PdfWriter::escape_pdf_string("back\\slash"), "back\\\\slash");
+    }
+
+    #[test]
+    fn test_encode_text_string() {
+        // Printable ASCII: the escaped literal, unchanged from before.
+        assert_eq!(PdfWriter::encode_text_string("A (b)"), "(A \\(b\\))");
+        assert_eq!(PdfWriter::encode_text_string(""), "()");
+        // Non-ASCII: UTF-16BE with a BOM. U+00DC is 00DC.
+        assert_eq!(PdfWriter::encode_text_string("Üb"), "<FEFF00DC0062>");
+        // Outside the BMP: a surrogate pair (U+1D11E -> D834 DD1E).
+        assert_eq!(PdfWriter::encode_text_string("𝄞"), "<FEFFD834DD1E>");
+        // A control character is not printable ASCII and is not left raw.
+        assert_eq!(PdfWriter::encode_text_string("a\nb"), "<FEFF0061000A0062>");
     }
 
     #[test]
