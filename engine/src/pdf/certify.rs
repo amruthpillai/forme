@@ -311,13 +311,22 @@ fn build_incremental_update(
     );
 
     if let Some(ref reason) = config.reason {
-        sig_dict.push_str(&format!("/Reason ({})\n", escape_pdf_string(reason)));
+        sig_dict.push_str(&format!(
+            "/Reason {}\n",
+            super::PdfWriter::encode_text_string(reason)
+        ));
     }
     if let Some(ref location) = config.location {
-        sig_dict.push_str(&format!("/Location ({})\n", escape_pdf_string(location)));
+        sig_dict.push_str(&format!(
+            "/Location {}\n",
+            super::PdfWriter::encode_text_string(location)
+        ));
     }
     if let Some(ref contact) = config.contact {
-        sig_dict.push_str(&format!("/ContactInfo ({})\n", escape_pdf_string(contact)));
+        sig_dict.push_str(&format!(
+            "/ContactInfo {}\n",
+            super::PdfWriter::encode_text_string(contact)
+        ));
     }
 
     // Cert as hex string

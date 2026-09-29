@@ -14752,3 +14752,305 @@ fn fixed_and_watermark_content_inherits_document_default_style() {
         "footer paints past the band reserved for it: bottom {footer_bottom:.2} > {content_bottom:.2}"
     );
 }
+
+// ── DocInfo text strings + Producer parity (issue #158) ─────────────────
+
+/// Decode the PDF string token that follows `key` in `haystack` as a PDF
+/// text string (ISO 32000-1 7.9.2.2). A `<FEFF...>` hex string is UTF-16BE
+/// with a BOM; a `(...)` literal is read byte-per-char, which agrees with
+/// PDFDocEncoding for the printable ASCII these tests put there. Returns
+/// the text and whether it came from a UTF-16BE hex string.
+fn decode_text_string_after(haystack: &[u8], key: &str) -> Option<(String, bool)> {
+    let pos = haystack
+        .windows(key.len())
+        .position(|w| w == key.as_bytes())?;
+    let mut rest = &haystack[pos + key.len()..];
+    while rest.first() == Some(&b' ') {
+        rest = &rest[1..];
+    }
+    match rest.first()? {
+        b'<' => {
+            let end = rest.iter().position(|&b| b == b'>')?;
+            let hex = std::str::from_utf8(&rest[1..end]).ok()?;
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            assert_eq!(
+                &bytes[..2],
+                &[0xFE, 0xFF],
+                "a hex text string must start with the UTF-16BE BOM"
+            );
+            let units: Vec<u16> = bytes[2..]
+                .chunks(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect();
+            Some((String::from_utf16(&units).ok()?, true))
+        }
+        b'(' => {
+            let mut out = String::new();
+            let mut i = 1;
+            while rest[i] != b')' {
+                if rest[i] == b'\\' {
+                    i += 1;
+                }
+                out.push(rest[i] as char);
+                i += 1;
+            }
+            Some((out, false))
+        }
+        _ => None,
+    }
+}
+
+/// The bytes of the /Info object: the dictionary carrying /Producer.
+fn info_dict_bytes(bytes: &[u8]) -> &[u8] {
+    let p = bytes
+        .windows(9)
+        .position(|w| w == b"/Producer")
+        .expect("an /Info dictionary with /Producer");
+    let start = bytes[..p]
+        .windows(3)
+        .rposition(|w| w == b"obj")
+        .expect("object header before /Producer");
+    let end = p + bytes[p..]
+        .windows(6)
+        .position(|w| w == b"endobj")
+        .expect("endobj after /Producer");
+    &bytes[start..end]
+}
+
+#[test]
+fn docinfo_non_ascii_text_is_utf16be_with_bom() {
+    // Issue #158: /Title was raw UTF-8 inside a literal string, which every
+    // reader decodes as PDFDocEncoding, so "Übertragungsurkunde" showed as
+    // "Ãœbertragungsurkunde". A text string that is not plain ASCII must be
+    // UTF-16BE with a BOM. The clef (U+1D11E) is outside the BMP and so
+    // exercises the surrogate pair.
+    let title = "Übertragungsurkunde";
+    let author = "Zoë Brontë 𝄞";
+    let subject = "Größe (Ω)";
+    let json = format!(
+        r#"{{ "children": [ {{ "kind": {{ "type": "Text", "content": "Hello" }}, "style": {{}}, "children": [] }} ],
+            "metadata": {{ "title": "{title}", "author": "{author}", "subject": "{subject}" }} }}"#
+    );
+    let bytes = forme::render_json(&json).expect("renders");
+    let info = info_dict_bytes(&bytes);
+    for (key, want) in [
+        ("/Title", title),
+        ("/Author", author),
+        ("/Subject", subject),
+    ] {
+        let (got, hex) = decode_text_string_after(info, key)
+            .unwrap_or_else(|| panic!("{key} missing from /Info"));
+        assert!(
+            hex,
+            "{key} must be a <FEFF...> UTF-16BE string, got the literal {got:?}"
+        );
+        assert_eq!(got, want, "{key} must decode back to the input");
+    }
+    assert!(
+        !info.windows(2).any(|w| w == "Ü".as_bytes()),
+        "no raw UTF-8 may remain in /Info"
+    );
+}
+
+#[test]
+fn docinfo_ascii_text_stays_an_escaped_literal() {
+    // Plain printable ASCII keeps the literal form it always had, with the
+    // string delimiters escaped, so ASCII-only output is unchanged.
+    let json = r#"{ "children": [ { "kind": { "type": "Text", "content": "Hello" }, "style": {}, "children": [] } ],
+        "metadata": { "title": "Report (Q3) \\ final" } }"#;
+    let bytes = forme::render_json(json).expect("renders");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains(r"/Title (Report \(Q3\) \\ final)"),
+        "an ASCII title must stay an escaped literal"
+    );
+}
+
+#[test]
+fn outline_non_ascii_title_is_utf16be_with_bom() {
+    // An outline item's /Title is a text string too (ISO 32000-1 Table 153)
+    // and went through the same raw-UTF-8 path.
+    let json = r#"{ "children": [
+        { "kind": { "type": "Text", "content": "Kapitel" }, "bookmark": "Übersicht", "style": {}, "children": [] }
+    ], "metadata": {} }"#;
+    let bytes = forme::render_json(json).expect("renders");
+    let (got, hex) = decode_text_string_after(&bytes, "/Title").expect("an outline item /Title");
+    assert!(hex, "a non-ASCII outline title must be a <FEFF...> string");
+    assert_eq!(got, "Übersicht");
+}
+
+#[test]
+fn docinfo_producer_and_creator_match_xmp() {
+    // Issue #158: DocInfo said /Producer (Forme 0.6) while the XMP said
+    // pdf:Producer "Forme". PDF/A requires each DocInfo entry to agree with
+    // its XMP counterpart, and veraPDF does not check this pair, so it is
+    // asserted here. /Creator pairs with xmp:CreatorTool, /Title with
+    // dc:title.
+    let json = r#"{ "children": [ { "kind": { "type": "Text", "content": "Hello" }, "style": { "fontFamily": "Noto Sans" }, "children": [] } ],
+        "metadata": { "title": "Übertragungsurkunde" }, "pdfa": "2b" }"#;
+    let bytes = forme::render_json(json).expect("PDF/A-2b renders");
+    let info = info_dict_bytes(&bytes);
+    let text = String::from_utf8_lossy(&bytes);
+    let xmp_value = |open: &str| -> String {
+        let s = text
+            .find(open)
+            .unwrap_or_else(|| panic!("XMP {open} missing"))
+            + open.len();
+        let e = s + text[s..].find('<').unwrap();
+        text[s..e].to_string()
+    };
+    let (producer, _) = decode_text_string_after(info, "/Producer").unwrap();
+    assert_eq!(
+        producer,
+        xmp_value("<pdf:Producer>"),
+        "/Producer must equal pdf:Producer"
+    );
+    let (creator, _) = decode_text_string_after(info, "/Creator").unwrap();
+    assert_eq!(
+        creator,
+        xmp_value("<xmp:CreatorTool>"),
+        "/Creator must equal xmp:CreatorTool"
+    );
+    let (title, _) = decode_text_string_after(info, "/Title").unwrap();
+    assert_eq!(
+        title,
+        xmp_value(r#"<rdf:li xml:lang="x-default">"#),
+        "/Title must equal dc:title"
+    );
+}
+
+// ── Every other PDF text string (issue #158 follow-up) ───────────────────
+
+/// Assert that the string after `key` in `hay` is a `<FEFF...>` text
+/// string decoding to `want`.
+fn assert_utf16_text(hay: &[u8], key: &str, want: &str) {
+    let (got, hex) =
+        decode_text_string_after(hay, key).unwrap_or_else(|| panic!("{key} not found"));
+    assert!(
+        hex,
+        "{key} must be a <FEFF...> UTF-16BE string, got the literal {got:?}"
+    );
+    assert_eq!(got, want, "{key} must decode back to the input");
+}
+
+#[test]
+fn structure_alt_non_ascii_is_utf16be() {
+    // /Alt is a text string (ISO 32000-1 Table 323); screen readers read
+    // it aloud, so raw UTF-8 there is mojibake spoken to the user.
+    let json = r#"{ "children": [
+        { "kind": { "type": "Svg", "width": 50, "height": 50, "content": "<rect width=\"50\" height=\"50\" fill=\"red\"/>" },
+          "alt": "Grünes Quadrat", "style": {}, "children": [] }
+    ], "metadata": {}, "tagged": true }"#;
+    let bytes = forme::render_json(json).expect("renders");
+    assert_utf16_text(&bytes, "/Alt", "Grünes Quadrat");
+}
+
+#[test]
+fn form_field_text_strings_non_ascii_are_utf16be() {
+    // Field /T, /V, /DV and choice /Opt entries are text strings
+    // (ISO 32000-1 Tables 220, 222, 231).
+    let json = r#"{ "children": [
+        { "kind": { "type": "TextField", "name": "Straße", "width": 200, "height": 24,
+            "value": "Müller", "font_size": 12, "multiline": false, "password": false, "read_only": false },
+          "style": {}, "children": [] },
+        { "kind": { "type": "Dropdown", "name": "größe", "width": 150, "height": 24,
+            "options": ["Klein", "Groß"], "value": "Groß", "font_size": 12, "read_only": false },
+          "style": {}, "children": [] }
+    ], "metadata": {} }"#;
+    let bytes = forme::render_json(json).expect("renders");
+    let text = String::from_utf8_lossy(&bytes);
+    // Byte offsets, not offsets into the lossy string: compressed streams
+    // make the two diverge.
+    let find = |needle: &[u8]| bytes.windows(needle.len()).position(|w| w == needle);
+    let tx = find(b"/FT /Tx").expect("text field widget");
+    let tx = &bytes[tx..];
+    assert_utf16_text(tx, "/T ", "Straße");
+    assert_utf16_text(tx, "/V ", "Müller");
+    assert_utf16_text(tx, "/DV ", "Müller");
+    let ch = find(b"/FT /Ch").expect("choice widget");
+    let ch = &bytes[ch..];
+    assert_utf16_text(ch, "/T ", "größe");
+    assert_utf16_text(ch, "/V ", "Groß");
+    let opt = text[text.find("/Opt [").unwrap()..].to_string();
+    assert!(
+        opt.starts_with("/Opt [(Klein) <FEFF"),
+        "ASCII option stays a literal, non-ASCII becomes UTF-16BE: {}",
+        opt.chars().take(40).collect::<String>()
+    );
+}
+
+#[test]
+fn attachment_desc_and_uf_non_ascii_are_utf16be() {
+    // /Desc and /UF are text strings (ISO 32000-1 Table 44); /F is a byte
+    // string and keeps the literal form.
+    let json = r#"{ "children": [ { "kind": { "type": "Text", "content": "x" }, "style": {}, "children": [] } ],
+        "metadata": {},
+        "attachments": [ { "name": "Übersicht.csv", "src": "YSxiCjEsMg==", "mimeType": "text/csv", "description": "Monatsübersicht" } ] }"#;
+    let bytes = forme::render_json(json).expect("renders");
+    assert_utf16_text(&bytes, "/UF", "Übersicht.csv");
+    assert_utf16_text(&bytes, "/Desc", "Monatsübersicht");
+}
+
+#[test]
+fn link_contents_non_ascii_is_utf16be() {
+    // A link annotation's /Contents is a text string (Table 164). /URI is
+    // an ASCII byte string (Table 206) and keeps the literal form.
+    let internal = r##"{ "children": [
+        { "kind": { "type": "Text", "content": "jump", "href": "#Übersicht" }, "style": {} },
+        { "kind": { "type": "PageBreak" } },
+        { "kind": { "type": "View" }, "bookmark": "Übersicht", "children": [ { "kind": { "type": "Text", "content": "target" } } ] }
+    ] }"##;
+    let bytes = forme::render_json(internal).expect("renders");
+    assert_utf16_text(&bytes, "/F 4 /Contents", "Link to Übersicht");
+
+    let external = r#"{ "children": [
+        { "kind": { "type": "Text", "content": "go", "href": "https://example.com/straße" }, "style": {} }
+    ] }"#;
+    let bytes = forme::render_json(external).expect("renders");
+    assert_utf16_text(&bytes, "/F 4 /Contents", "https://example.com/straße");
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("/URI (https://example.com/stra"),
+        "/URI stays a literal byte string"
+    );
+}
+
+#[test]
+fn signature_text_strings_non_ascii_are_utf16be() {
+    // /Reason, /Location and /ContactInfo are text strings (Table 252).
+    let (cert_pem, key_pem) = generate_test_cert_and_key();
+    let unsigned_pdf = render_to_pdf(&default_doc(vec![make_text("sig", 12.0)]));
+    let config = forme::CertificationConfig {
+        certificate_pem: cert_pem,
+        private_key_pem: key_pem,
+        reason: Some("Geprüft".to_string()),
+        location: Some("Zürich".to_string()),
+        contact: Some("jürgen@example.com".to_string()),
+        visible: false,
+        x: None,
+        y: None,
+        width: None,
+        height: None,
+    };
+    let signed = forme::certify_pdf(&unsigned_pdf, &config).unwrap();
+    assert_utf16_text(&signed, "/Reason", "Geprüft");
+    assert_utf16_text(&signed, "/Location", "Zürich");
+    assert_utf16_text(&signed, "/ContactInfo", "jürgen@example.com");
+}
+
+#[test]
+fn docinfo_emitted_for_subject_alone() {
+    // A subject with no title or author used to be dropped: /Info was
+    // only written when title or author was set.
+    let json = r#"{ "children": [ { "kind": { "type": "Text", "content": "x" }, "style": {}, "children": [] } ],
+        "metadata": { "subject": "Quarterly numbers" } }"#;
+    let bytes = forme::render_json(json).expect("renders");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("/Subject (Quarterly numbers)"),
+        "a subject-only document must still write /Info"
+    );
+    assert!(text.contains("/Info "), "the trailer must reference /Info");
+}
