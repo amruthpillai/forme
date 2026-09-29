@@ -14275,3 +14275,109 @@ fn a_flex_item_margin_is_free_space_a_grow_sibling_cannot_take() {
         grower.width
     );
 }
+
+/// Issue #160: content inside `<Fixed>` ignored the Document's default style.
+/// Fixed nodes are stored on the page cursor and laid out again per page by
+/// `inject_fixed_elements`, which resolved them with NO parent style, so a
+/// footer painted Helvetica 12 black while the body used the document font,
+/// size and colour. The measure pass did inherit, so the band reserved for
+/// the footer was also computed at a different size than the footer painted.
+/// Watermarks were injected the same way. Asserted at the glyph level (what
+/// the PDF writer paints), including a `{{pageNumber}}` placeholder.
+#[test]
+fn fixed_and_watermark_content_inherits_document_default_style() {
+    let json = r##"{
+      "defaultStyle": {
+        "fontFamily": "Courier", "fontSize": 9,
+        "color": { "r": 0.8, "g": 0.0, "b": 0.0, "a": 1.0 }
+      },
+      "children": [
+        { "kind": { "type": "Page", "config": { "size": "A4",
+            "margin": { "top": 54, "right": 54, "bottom": 54, "left": 54 }, "wrap": true } },
+          "style": {},
+          "children": [
+            { "kind": { "type": "Fixed", "position": "Header" }, "style": {},
+              "children": [ { "kind": { "type": "Text", "content": "header text" }, "style": {}, "children": [] } ] },
+            { "kind": { "type": "Fixed", "position": "Footer" }, "style": {},
+              "children": [ { "kind": { "type": "Text", "content": "footer {{pageNumber}}" }, "style": {}, "children": [] } ] },
+            { "kind": { "type": "Watermark", "text": "DRAFT", "font_size": 60, "angle": -45 },
+              "style": { "color": { "r": 0.0, "g": 0.0, "b": 0.0, "a": 1.0 }, "opacity": 0.1 },
+              "children": [] },
+            { "kind": { "type": "Text", "content": "body text" }, "style": {}, "children": [] }
+          ] }
+      ],
+      "metadata": {}
+    }"##;
+    let doc: Document = serde_json::from_str(json).expect("valid document JSON");
+    let pages = layout_doc(&doc);
+    assert_eq!(pages.len(), 1);
+
+    // (line text, font family, font size, colour, element bottom) for every
+    // painted text line, header/footer/watermark included.
+    type Line = (String, String, f64, Option<(f64, f64, f64)>, f64);
+    fn collect(els: &[forme::layout::LayoutElement], out: &mut Vec<Line>) {
+        for el in els {
+            let lines = match &el.draw {
+                forme::layout::DrawCommand::Text { lines, .. } => Some(lines),
+                forme::layout::DrawCommand::Watermark { lines, .. } => Some(lines),
+                _ => None,
+            };
+            for line in lines.into_iter().flatten() {
+                let text: String = line.glyphs.iter().map(|g| g.char_value).collect();
+                let g = line.glyphs.first().expect("a painted line has glyphs");
+                out.push((
+                    text,
+                    g.font_family.to_string(),
+                    g.font_size,
+                    g.color.map(|c| (c.r, c.g, c.b)),
+                    el.y + el.height,
+                ));
+            }
+            collect(&el.children, out);
+        }
+    }
+    let mut lines = Vec::new();
+    collect(&pages[0].elements, &mut lines);
+    let find = |needle: &str| -> Line {
+        lines
+            .iter()
+            .find(|(t, ..)| t.contains(needle))
+            .unwrap_or_else(|| panic!("no painted line containing {needle:?} in {lines:?}"))
+            .clone()
+    };
+
+    let red = (0.8, 0.0, 0.0);
+    let body = find("body text");
+    assert_eq!(
+        (body.1.as_str(), body.2, body.3),
+        ("Courier", 9.0, Some(red)),
+        "control: the body inherits the document default style"
+    );
+    for needle in ["header text", "footer"] {
+        let line = find(needle);
+        assert_eq!(
+            (line.1.as_str(), line.2, line.3),
+            ("Courier", 9.0, Some(red)),
+            "{needle:?} must inherit the document font, size and colour like the body"
+        );
+    }
+
+    // A watermark sets its own size and colour, but its font family is
+    // inherited like any other text.
+    let wm = find("DRAFT");
+    assert_eq!(
+        wm.1.as_str(),
+        "Courier",
+        "watermark inherits the document font family"
+    );
+    assert_eq!(wm.2, 60.0, "watermark keeps its own font size");
+
+    // The footer band was measured with the inherited style, so the painted
+    // footer must end inside the content area, not past the bottom margin.
+    let content_bottom = pages[0].height - 54.0;
+    let footer_bottom = find("footer").4;
+    assert!(
+        footer_bottom <= content_bottom + 0.01,
+        "footer paints past the band reserved for it: bottom {footer_bottom:.2} > {content_bottom:.2}"
+    );
+}

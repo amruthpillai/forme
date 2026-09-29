@@ -409,6 +409,21 @@ impl LayoutInfo {
     }
 }
 
+/// A fixed header/footer node, its measured height, and the resolved style
+/// of the parent it was declared in.
+///
+/// Fixed content is laid out again on every page by `inject_fixed_elements`,
+/// long after the tree walk that knew its parent. Without the parent style it
+/// was resolved against nothing, so it lost everything inherited (the
+/// Document's default style, the Page's style): a footer painted Helvetica 12
+/// black under a document set to another font, size and colour (issue #160),
+/// while its height had been MEASURED with the inherited style.
+pub(crate) type FixedEntry = (Node, f64, Option<ResolvedStyle>);
+
+/// A watermark node and the resolved style of the parent it was declared in
+/// (see [`FixedEntry`]; watermarks are injected per page the same way).
+pub(crate) type WatermarkEntry = (Node, Option<ResolvedStyle>);
+
 /// A fully laid-out page ready for PDF serialization.
 #[derive(Debug, Clone)]
 pub struct LayoutPage {
@@ -416,11 +431,11 @@ pub struct LayoutPage {
     pub height: f64,
     pub elements: Vec<LayoutElement>,
     /// Fixed header nodes to inject after layout (internal use).
-    pub(crate) fixed_header: Vec<(Node, f64)>,
+    pub(crate) fixed_header: Vec<FixedEntry>,
     /// Fixed footer nodes to inject after layout (internal use).
-    pub(crate) fixed_footer: Vec<(Node, f64)>,
+    pub(crate) fixed_footer: Vec<FixedEntry>,
     /// Watermark nodes to inject after layout (internal use).
-    pub(crate) watermarks: Vec<Node>,
+    pub(crate) watermarks: Vec<WatermarkEntry>,
     /// Page config needed for fixed element layout (internal use).
     pub(crate) config: PageConfig,
     /// The page's NAME (CSS `page` property), for fixed-element scoping.
@@ -1075,10 +1090,10 @@ struct PageCursor {
     content_height: f64,
     y: f64,
     elements: Vec<LayoutElement>,
-    fixed_header: Vec<(Node, f64)>,
-    fixed_footer: Vec<(Node, f64)>,
+    fixed_header: Vec<FixedEntry>,
+    fixed_footer: Vec<FixedEntry>,
     /// Watermark nodes stored for repetition on every page.
-    watermarks: Vec<Node>,
+    watermarks: Vec<WatermarkEntry>,
     content_x: f64,
     content_y: f64,
     /// Extra Y offset applied on continuation pages (e.g. parent view's padding+border)
@@ -1243,8 +1258,8 @@ impl PageCursor {
         let header_height: f64 = cursor
             .fixed_header
             .iter()
-            .filter(|(n, _)| cursor.fixed_applies(n))
-            .map(|(_, h)| *h)
+            .filter(|(n, _, _)| cursor.fixed_applies(n))
+            .map(|(_, h, _)| *h)
             .sum();
         cursor.y = header_height + cursor.continuation_top_offset;
         cursor
@@ -1262,8 +1277,8 @@ impl PageCursor {
         let footer_height: f64 = self
             .fixed_footer
             .iter()
-            .filter(|(n, _)| self.fixed_applies(n))
-            .map(|(_, h)| *h)
+            .filter(|(n, _, _)| self.fixed_applies(n))
+            .map(|(_, h, _)| *h)
             .sum();
         (self.content_height - self.y - footer_height).max(0.0)
     }
@@ -1330,8 +1345,8 @@ impl PageCursor {
         let header_height: f64 = cursor
             .fixed_header
             .iter()
-            .filter(|(n, _)| cursor.fixed_applies(n))
-            .map(|(_, h)| *h)
+            .filter(|(n, _, _)| cursor.fixed_applies(n))
+            .map(|(_, h, _)| *h)
             .sum();
         cursor.y = header_height + cursor.continuation_top_offset;
 
@@ -1603,7 +1618,9 @@ impl LayoutEngine {
                 let height = self.measure_node_height(node, available_width, &style, font_context);
                 match position {
                     FixedPosition::Header => {
-                        cursor.fixed_header.push((node.clone(), height));
+                        cursor
+                            .fixed_header
+                            .push((node.clone(), height, parent_style.cloned()));
                         // Space is only consumed on pages the element
                         // actually appears on (CSS :first suppression,
                         // parity, page-name scoping).
@@ -1613,14 +1630,18 @@ impl LayoutEngine {
                         }
                     }
                     FixedPosition::Footer => {
-                        cursor.fixed_footer.push((node.clone(), height));
+                        cursor
+                            .fixed_footer
+                            .push((node.clone(), height, parent_style.cloned()));
                     }
                 }
             }
 
             NodeKind::Watermark { .. } => {
                 // Watermarks take zero layout height — just store on cursor for injection
-                cursor.watermarks.push(node.clone());
+                cursor
+                    .watermarks
+                    .push((node.clone(), parent_style.cloned()));
             }
 
             NodeKind::TextField {
@@ -2438,7 +2459,7 @@ impl LayoutEngine {
 
             // A. First page — wrap elements from snapshot onward
             let page = &mut pages[initial_page_count];
-            let footer_h: f64 = page.fixed_footer.iter().map(|(_, h)| *h).sum();
+            let footer_h: f64 = page.fixed_footer.iter().map(|(_, h, _)| *h).sum();
             let page_content_bottom =
                 page.config.margin.top + (page.height - page.config.margin.vertical()) - footer_h;
             let our_elements: Vec<LayoutElement> = drain_since(&mut page.elements, snapshot);
@@ -2469,9 +2490,9 @@ impl LayoutEngine {
 
             // B. Intermediate pages — wrap ALL elements
             for page in &mut pages[initial_page_count + 1..] {
-                let header_h: f64 = page.fixed_header.iter().map(|(_, h)| *h).sum();
+                let header_h: f64 = page.fixed_header.iter().map(|(_, h, _)| *h).sum();
                 let content_top = page.config.margin.top + header_h;
-                let footer_h: f64 = page.fixed_footer.iter().map(|(_, h)| *h).sum();
+                let footer_h: f64 = page.fixed_footer.iter().map(|(_, h, _)| *h).sum();
                 let content_bottom = page.config.margin.top
                     + (page.height - page.config.margin.vertical())
                     - footer_h;
@@ -2503,7 +2524,7 @@ impl LayoutEngine {
             // C. Current page (cursor.elements) — wrap ALL elements
             let all_elements: Vec<LayoutElement> = std::mem::take(&mut cursor.elements);
             if !all_elements.is_empty() || spans_by_height {
-                let header_h: f64 = cursor.fixed_header.iter().map(|(_, h)| *h).sum();
+                let header_h: f64 = cursor.fixed_header.iter().map(|(_, h, _)| *h).sum();
                 let content_top = cursor.content_y + header_h;
                 let rect_height =
                     cursor.content_y + cursor.y + padding.bottom + border.bottom - content_top;
@@ -3960,8 +3981,8 @@ impl LayoutEngine {
                 + padding.vertical()
                 + border.vertical();
             let fresh_page_available = cursor.content_height
-                - cursor.fixed_header.iter().map(|(_, h)| *h).sum::<f64>()
-                - cursor.fixed_footer.iter().map(|(_, h)| *h).sum::<f64>();
+                - cursor.fixed_header.iter().map(|(_, h, _)| *h).sum::<f64>()
+                - cursor.fixed_footer.iter().map(|(_, h, _)| *h).sum::<f64>();
             if total_height > cursor.remaining_height()
                 && total_height <= fresh_page_available
                 && cursor.y > 0.0
@@ -4021,8 +4042,8 @@ impl LayoutEngine {
 
             let needed = total_header_h + first_body_h;
             let fresh_page_available = cursor.content_height
-                - cursor.fixed_header.iter().map(|(_, h)| *h).sum::<f64>()
-                - cursor.fixed_footer.iter().map(|(_, h)| *h).sum::<f64>();
+                - cursor.fixed_header.iter().map(|(_, h, _)| *h).sum::<f64>()
+                - cursor.fixed_footer.iter().map(|(_, h, _)| *h).sum::<f64>();
 
             if needed > cursor.remaining_height() && needed <= fresh_page_available {
                 pages.push(cursor.finalize());
@@ -4056,8 +4077,8 @@ impl LayoutEngine {
             // that's a render defect worth saying out loud, not a reason to
             // print empty pages.
             let fresh_page_available = cursor.content_height
-                - cursor.fixed_header.iter().map(|(_, h)| *h).sum::<f64>()
-                - cursor.fixed_footer.iter().map(|(_, h)| *h).sum::<f64>();
+                - cursor.fixed_header.iter().map(|(_, h, _)| *h).sum::<f64>()
+                - cursor.fixed_footer.iter().map(|(_, h, _)| *h).sum::<f64>();
             if row_height > fresh_page_available {
                 self.defect(format!(
                     "render defect: table row needs {row_height:.0}pt but a page holds {fresh_page_available:.0}pt — rows are atomic, so it is placed whole and overflows",
@@ -4172,7 +4193,7 @@ impl LayoutEngine {
 
             // A. The page the table started on — wrap from the snapshot.
             let page = &mut pages[initial_page_count];
-            let footer_h: f64 = page.fixed_footer.iter().map(|(_, h)| *h).sum();
+            let footer_h: f64 = page.fixed_footer.iter().map(|(_, h, _)| *h).sum();
             let page_content_bottom =
                 page.config.margin.top + (page.height - page.config.margin.vertical()) - footer_h;
             let our_elements: Vec<LayoutElement> = drain_since(&mut page.elements, snapshot);
@@ -4187,9 +4208,9 @@ impl LayoutEngine {
 
             // B. Intermediate pages — entirely table content.
             for page in &mut pages[initial_page_count + 1..] {
-                let header_h: f64 = page.fixed_header.iter().map(|(_, h)| *h).sum();
+                let header_h: f64 = page.fixed_header.iter().map(|(_, h, _)| *h).sum();
                 let content_top = page.config.margin.top + header_h;
-                let footer_h: f64 = page.fixed_footer.iter().map(|(_, h)| *h).sum();
+                let footer_h: f64 = page.fixed_footer.iter().map(|(_, h, _)| *h).sum();
                 let content_bottom = page.config.margin.top
                     + (page.height - page.config.margin.vertical())
                     - footer_h;
@@ -4207,7 +4228,7 @@ impl LayoutEngine {
             // C. Current page — everything on it is table content.
             let all_elements: Vec<LayoutElement> = std::mem::take(&mut cursor.elements);
             if !all_elements.is_empty() {
-                let header_h: f64 = cursor.fixed_header.iter().map(|(_, h)| *h).sum();
+                let header_h: f64 = cursor.fixed_header.iter().map(|(_, h, _)| *h).sum();
                 let content_top = cursor.content_y + header_h;
                 cursor.elements.push(make_wrapper(
                     content_top,
@@ -7630,14 +7651,14 @@ impl LayoutEngine {
                 let cy = page_h / 2.0;
 
                 let mut watermark_elements = Vec::new();
-                for wm_node in &page.watermarks {
+                for (wm_node, wm_parent) in &page.watermarks {
                     if let NodeKind::Watermark {
                         text,
                         font_size,
                         angle,
                     } = &wm_node.kind
                     {
-                        let style = wm_node.style.resolve(None, page_w);
+                        let style = wm_node.style.resolve(wm_parent.as_ref(), page_w);
                         let color = style.color;
                         let opacity = style.opacity;
                         let angle_rad = angle.to_radians();
@@ -7772,7 +7793,7 @@ impl LayoutEngine {
             // Lay out headers at top of content area
             if !page.fixed_header.is_empty() {
                 let mut hdr_cursor = PageCursor::new(&page.config);
-                for (node, _h) in &page.fixed_header {
+                for (node, _h, parent) in &page.fixed_header {
                     // The enumerate index is the authoritative page number
                     // for First/NotFirst filtering.
                     if !fixed_applies_on(node, page_index, page.page_name.as_deref()) {
@@ -7780,7 +7801,7 @@ impl LayoutEngine {
                     }
                     let cw = hdr_cursor.content_width;
                     let cx = hdr_cursor.content_x;
-                    let style = node.style.resolve(None, cw);
+                    let style = node.style.resolve(parent.as_ref(), cw);
                     self.layout_view(
                         node,
                         &style,
@@ -7806,18 +7827,18 @@ impl LayoutEngine {
                 let total_ftr: f64 = page
                     .fixed_footer
                     .iter()
-                    .filter(|(n, _)| fixed_applies_on(n, page_index, page.page_name.as_deref()))
-                    .map(|(_, h)| *h)
+                    .filter(|(n, _, _)| fixed_applies_on(n, page_index, page.page_name.as_deref()))
+                    .map(|(_, h, _)| *h)
                     .sum();
                 let target_y = ftr_cursor.content_height - total_ftr;
                 // Layout from y=0
-                for (node, _h) in &page.fixed_footer {
+                for (node, _h, parent) in &page.fixed_footer {
                     if !fixed_applies_on(node, page_index, page.page_name.as_deref()) {
                         continue;
                     }
                     let cw = ftr_cursor.content_width;
                     let cx = ftr_cursor.content_x;
-                    let style = node.style.resolve(None, cw);
+                    let style = node.style.resolve(parent.as_ref(), cw);
                     self.layout_view(
                         node,
                         &style,
