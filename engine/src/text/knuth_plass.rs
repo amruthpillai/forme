@@ -766,6 +766,21 @@ pub fn reconstruct_lines(
     lines
 }
 
+/// Make word spaces incompressible, for text that will not be justified.
+///
+/// Glue carries shrink so the breaker can compress a justified line, but
+/// only `reconstruct_*` with `justify` actually narrows the spaces. A
+/// ragged line is drawn at its natural width, so a break chosen by
+/// shrinking rendered past the box (the Northmoor payslip footer ran 3.9pt
+/// into the margin). Stretch stays: a ragged line may fall short.
+pub fn disallow_shrink(items: &mut [Item]) {
+    for item in items {
+        if let Item::Glue { shrink, .. } = item {
+            *shrink = 0.0;
+        }
+    }
+}
+
 /// Build items from multi-style (StyledChar) text.
 pub fn build_items_styled(
     chars: &[super::StyledChar],
