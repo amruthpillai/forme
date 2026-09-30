@@ -15380,3 +15380,74 @@ fn test_tagged_inline_link_wrapping_lines_stays_balanced() {
         "each /Link element has one marked-content sequence"
     );
 }
+
+// ─── #156 follow-up: right-to-left text drawn in visual order ─────────
+
+/// Lay out one text line in Liberation Sans (in the repo, and covers
+/// Hebrew, so this runs on CI too) and read its glyphs left to right.
+fn visual_order(content: &str, direction: Direction) -> String {
+    let font = std::fs::read("../packages/fonts-standard/fonts/LiberationSans-Regular.ttf")
+        .expect("Liberation Sans in the repo");
+    let mut font_context = FontContext::new();
+    font_context
+        .registry_mut()
+        .register("Liberation", 400, false, font);
+    let mut text = make_text(content, 16.0);
+    text.style.font_family = Some("Liberation".to_string());
+    text.style.direction = Some(direction);
+    let doc = default_doc(vec![text]);
+    let pages = LayoutEngine::new().layout(&doc, &font_context);
+    fn glyphs(els: &[forme::layout::LayoutElement], out: &mut Vec<(f64, char)>) {
+        for el in els {
+            if let forme::layout::DrawCommand::Text { lines, .. } = &el.draw {
+                for line in lines {
+                    for g in &line.glyphs {
+                        out.push((line.x + g.x_offset, g.char_value));
+                    }
+                }
+            }
+            glyphs(&el.children, out);
+        }
+    }
+    let mut out = Vec::new();
+    glyphs(&pages[0].elements, &mut out);
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    out.into_iter().map(|(_, c)| c).collect()
+}
+
+/// Shaping already returns an RTL run's glyphs in visual order, and BiDi
+/// reordering then reversed them again, so Hebrew was drawn in logical
+/// order left to right: it read backwards on the page and extracted
+/// reversed ("שלום עולם" came out "םלוע םולש"). Read left to right, an RTL
+/// run's glyphs are its logical text reversed.
+#[test]
+fn test_rtl_text_is_drawn_in_visual_order() {
+    for dir in [Direction::Rtl, Direction::Auto, Direction::Ltr] {
+        assert_eq!(
+            visual_order("שלום עולם", dir),
+            "םלוע םולש",
+            "a Hebrew line ({dir:?} paragraph) reads right to left"
+        );
+    }
+}
+
+/// In a left-to-right paragraph an embedded Hebrew phrase is reversed in
+/// place and the Latin around it keeps its order.
+#[test]
+fn test_rtl_phrase_inside_ltr_text_is_reversed_in_place() {
+    assert_eq!(
+        visual_order("Total: שלום עולם today", Direction::Ltr),
+        "Total: םלוע םולש today"
+    );
+}
+
+/// An RTL paragraph with embedded numbers and Latin: the LTR pieces keep
+/// their own order inside the reversed line. Expected order read off
+/// Chrome's glyph positions for the same line.
+#[test]
+fn test_rtl_paragraph_with_embedded_ltr_matches_chrome_order() {
+    assert_eq!(
+        visual_order("המחיר הוא 120 שקלים עבור ABC בלבד", Direction::Rtl),
+        "דבלב ABC רובע םילקש 120 אוה ריחמה"
+    );
+}

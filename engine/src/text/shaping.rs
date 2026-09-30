@@ -37,7 +37,12 @@ pub fn shape_text(text: &str, font_data: &[u8]) -> Option<Vec<ShapedGlyph>> {
 /// Shape text with explicit direction control.
 ///
 /// When `is_rtl` is true, the shaper applies RTL contextual forms (e.g.,
-/// Arabic initial/medial/final forms) and produces glyphs in visual order.
+/// Arabic initial/medial/final forms). Glyphs are returned in LOGICAL order
+/// either way: every caller hands them to `bidi::reorder_line_glyphs`, which
+/// expects logical order and reverses RTL runs itself. The shaper's own RTL
+/// output is visual, and passing it through unreversed reversed each RTL
+/// run twice, so Hebrew was drawn backwards and Arabic words came out in
+/// reverse order.
 pub fn shape_text_with_direction(
     text: &str,
     font_data: &[u8],
@@ -80,8 +85,12 @@ pub fn shape_text_with_direction(
                 y_offset: pos.y_offset,
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
 
+    let mut glyphs = glyphs;
+    if is_rtl {
+        glyphs.reverse();
+    }
     Some(glyphs)
 }
 
