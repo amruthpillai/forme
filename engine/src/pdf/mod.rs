@@ -147,6 +147,11 @@ struct CustomFontEmbedData {
     glyph_to_text: HashMap<u16, String>,
     /// Legacy fallback: maps chars to subset GIDs (for page number placeholders).
     char_to_gid: HashMap<char, u16>,
+    /// The /W widths written for each subset GID (thousandths of an em,
+    /// exactly as written), and /DW. A viewer advances by these, so the
+    /// text writer's TJ adjustments are computed against them.
+    pdf_widths: HashMap<u16, f64>,
+    default_width: u32,
     units_per_em: u16,
     ascender: i16,
     descender: i16,
@@ -2010,6 +2015,14 @@ impl PdfWriter {
                         };
                         let font_name = format!("F{}", idx);
 
+                        // A registered-font group starts at its first glyph's own
+                        // position (its TJ places the rest); the running cursor
+                        // can differ from it by a kerning or justification step.
+                        if builder.custom_font_data.contains_key(&font_key)
+                            && !has_placeholder_group(group)
+                        {
+                            x_cursor = line.x + first.x_offset;
+                        }
                         // Td is relative to current text matrix position
                         let dx = x_cursor - tm_x;
                         let dy = pdf_y - tm_y;
@@ -2038,6 +2051,8 @@ impl PdfWriter {
                         if is_custom {
                             if let Some(embed_data) = builder.custom_font_data.get(&font_key) {
                                 let mut hex = String::new();
+                                // Set when the group was written as a TJ array.
+                                let mut continue_after_show = false;
                                 if has_placeholder {
                                     // Sentinel text: replace with actual values and use char→gid fallback
                                     let pn = PAGE_NUMBER_SENTINEL.to_string();
@@ -2052,23 +2067,40 @@ impl PdfWriter {
                                     }
                                 } else {
                                     // Shaped text: use glyph IDs directly (remapped through subset)
-                                    for g in group.iter() {
-                                        let new_gid = embed_data
-                                            .gid_remap
-                                            .get(&g.glyph_id)
-                                            .copied()
-                                            .unwrap_or_else(|| {
-                                                // Fallback: try char→gid
-                                                embed_data
-                                                    .char_to_gid
-                                                    .get(&g.char_value)
-                                                    .copied()
-                                                    .unwrap_or(0)
-                                            });
-                                        let _ = write!(hex, "{:04X}", new_gid);
+                                    let gids: Vec<u16> = group
+                                        .iter()
+                                        .map(|g| {
+                                            embed_data
+                                                .gid_remap
+                                                .get(&g.glyph_id)
+                                                .copied()
+                                                .unwrap_or_else(|| {
+                                                    // Fallback: try char→gid
+                                                    embed_data
+                                                        .char_to_gid
+                                                        .get(&g.char_value)
+                                                        .copied()
+                                                        .unwrap_or(0)
+                                                })
+                                        })
+                                        .collect();
+                                    if let Some(tj) = Self::positioned_tj(
+                                        group,
+                                        &gids,
+                                        embed_data,
+                                        first.letter_spacing,
+                                    ) {
+                                        let _ = writeln!(stream, "{}", tj);
+                                        continue_after_show = true;
+                                    } else {
+                                        for gid in &gids {
+                                            let _ = write!(hex, "{:04X}", gid);
+                                        }
                                     }
                                 }
-                                let _ = writeln!(stream, "<{}> Tj", hex);
+                                if !continue_after_show {
+                                    let _ = writeln!(stream, "<{}> Tj", hex);
+                                }
                             } else {
                                 let _ = writeln!(stream, "<> Tj");
                             }
@@ -4100,7 +4132,8 @@ impl PdfWriter {
         // 3. CIDFont dictionary (DescendantFont)
         let cidfont_id = builder.objects.len();
         // Build /W array using new_gid→width from subset face
-        let w_array = Self::build_w_array_from_gids(&gid_remap, &subset_face, subset_upem);
+        let (w_array, pdf_widths) =
+            Self::build_w_array_from_gids(&gid_remap, &subset_face, subset_upem);
         let default_width = subset_face
             .glyph_hor_advance(ttf_parser::GlyphId(0))
             .map(|adv| (adv as f64 * 1000.0 / subset_upem as f64) as u32)
@@ -4156,6 +4189,8 @@ impl PdfWriter {
                 gid_remap: gid_remap_for_embed,
                 glyph_to_text: glyph_to_text_map,
                 char_to_gid,
+                pdf_widths,
+                default_width,
                 units_per_em,
                 ascender,
                 descender,
@@ -4170,10 +4205,10 @@ impl PdfWriter {
         gid_remap: &HashMap<u16, u16>,
         face: &ttf_parser::Face,
         units_per_em: u16,
-    ) -> String {
+    ) -> (String, HashMap<u16, f64>) {
         let scale = 1000.0 / units_per_em as f64;
 
-        let mut entries: Vec<(u16, u32)> = Vec::new();
+        let mut entries: Vec<(u16, f64)> = Vec::new();
         let mut seen_gids: HashSet<u16> = HashSet::new();
 
         for &new_gid in gid_remap.values() {
@@ -4184,7 +4219,10 @@ impl PdfWriter {
             let advance = face
                 .glyph_hor_advance(ttf_parser::GlyphId(new_gid))
                 .unwrap_or(0);
-            let width = (advance as f64 * scale) as u32;
+            // Exact, not truncated: a truncated width drew every glyph up to
+            // 1/1000 em narrower than layout placed it, a drift that grew
+            // along the line.
+            let width = advance as f64 * scale;
             entries.push((new_gid, width));
         }
 
@@ -4193,10 +4231,10 @@ impl PdfWriter {
         // Build the W array using individual entries: gid [width]
         let mut result = String::from("[");
         for (gid, width) in &entries {
-            let _ = write!(result, " {} [{}]", gid, width);
+            let _ = write!(result, " {} [{}]", gid, pdf_number(*width));
         }
         result.push_str(" ]");
-        result
+        (result, entries.into_iter().collect())
     }
 
     /// Build a ToUnicode CMap from new_gid → text mapping.
@@ -4324,6 +4362,89 @@ impl PdfWriter {
 
     /// Group consecutive glyphs by (font_family, font_weight, font_style, font_size, color)
     /// for multi-font text run rendering.
+    /// The show operators (`TJ`, with `Ts` where a glyph is raised or
+    /// lowered) that draw a registered-font group at its glyphs' layout
+    /// positions, or `None` when every step matches the font's widths and
+    /// nothing moves vertically (the group is then a plain `Tj`, as before).
+    ///
+    /// A viewer advances each glyph by its /W width plus Tc; layout placed it
+    /// with the shaper's advances (kerning, zero-width marks) and the
+    /// Knuth-Plass positions (justification, word spacing). Between glyphs
+    /// `i` and `i + 1` the array carries `(drawn - wanted) * 1000 / size`, so
+    /// every glyph lands on its own position. Tw cannot do the spacing part:
+    /// these fonts are Type0 / Identity-H, and Tw applies only to the
+    /// single-byte code 32 (ISO 32000-1 9.3.3).
+    fn positioned_tj(
+        group: &[&PositionedGlyph],
+        gids: &[u16],
+        embed: &CustomFontEmbedData,
+        char_spacing: f64,
+    ) -> Option<String> {
+        let size = group.first()?.font_size;
+        if size <= 0.0 {
+            return None;
+        }
+        let mut adjustments = vec![0.0_f64; group.len()];
+        let mut any = false;
+        for i in 0..group.len().saturating_sub(1) {
+            let width = embed
+                .pdf_widths
+                .get(&gids[i])
+                .copied()
+                .unwrap_or(embed.default_width as f64);
+            let drawn = width * size / 1000.0 + char_spacing;
+            let wanted = group[i + 1].x_offset - group[i].x_offset;
+            let delta = drawn - wanted;
+            if delta.abs() > 0.001 {
+                adjustments[i] = delta * 1000.0 / size;
+                any = true;
+            }
+        }
+        let rises: Vec<f64> = group
+            .iter()
+            .map(|g| {
+                if g.y_offset.abs() > 0.001 {
+                    g.y_offset
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        if !any && rises.iter().all(|r| *r == 0.0) {
+            return None;
+        }
+        // One TJ per run of equal rise; a change of rise (a mark the shaper
+        // moved vertically) is a Ts between them, reset to 0 at the end. An
+        // adjustment stays at the end of its glyph's segment: it moves the
+        // pen to where the next glyph starts, whatever that glyph's rise.
+        let mut out = String::new();
+        let mut rise = 0.0_f64;
+        let mut open = false;
+        for (i, gid) in gids.iter().enumerate() {
+            if rises[i] != rise {
+                if open {
+                    out.push_str("] TJ\n");
+                    open = false;
+                }
+                let _ = writeln!(out, "{} Ts", pdf_number(rises[i]));
+                rise = rises[i];
+            }
+            if !open {
+                out.push('[');
+                open = true;
+            }
+            let _ = write!(out, "<{:04X}>", gid);
+            if adjustments[i] != 0.0 && i + 1 < gids.len() {
+                let _ = write!(out, " {:.2} ", adjustments[i]);
+            }
+        }
+        out.push_str("] TJ");
+        if rise != 0.0 {
+            out.push_str("\n0 Ts");
+        }
+        Some(out)
+    }
+
     fn group_glyphs_by_style(glyphs: &[PositionedGlyph]) -> Vec<Vec<&PositionedGlyph>> {
         Self::group_glyphs(glyphs, false)
     }
@@ -5217,6 +5338,26 @@ fn pdf_escape_string(s: &str) -> String {
         }
     }
     out
+}
+
+/// A group carrying page-number sentinels, which is drawn from the
+/// substituted text rather than from its glyphs' positions.
+fn has_placeholder_group(group: &[&PositionedGlyph]) -> bool {
+    group
+        .iter()
+        .any(|g| g.char_value == PAGE_NUMBER_SENTINEL || g.char_value == TOTAL_PAGES_SENTINEL)
+}
+
+/// A PDF number with at most three decimals and no trailing zeros
+/// (556.152 -> "556.152", 556.0 -> "556").
+fn pdf_number(v: f64) -> String {
+    let s = format!("{:.3}", v);
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s.is_empty() || s == "-" {
+        "0".to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 #[cfg(test)]

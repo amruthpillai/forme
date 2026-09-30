@@ -904,6 +904,26 @@ pub struct PositionedGlyph {
     pub ligature: bool,
 }
 
+/// Where a shaped glyph is drawn: its cluster's Knuth-Plass position, plus how
+/// far the shaper's pen had moved inside that cluster, plus the shaper's own
+/// offset (GPOS). The positions carry justification and word spacing; the
+/// shaped path used to accumulate its own pen and ignore them, so its glyph
+/// offsets were natural while the standard-font path's were justified.
+/// Without a position for the cluster, the shaper's pen stands in.
+fn shaped_glyph_x(
+    char_positions: &[f64],
+    cluster: usize,
+    pen: f64,
+    cluster_pen: f64,
+    sg: &shaping::ShapedGlyph,
+    scale: f64,
+) -> f64 {
+    let base = char_positions
+        .get(cluster)
+        .map_or(pen, |&p| p + (pen - cluster_pen));
+    base + sg.x_offset as f64 * scale
+}
+
 /// The `(cluster_text, ligature)` pair for each shaped glyph, in glyph order.
 ///
 /// A cluster runs from its start index up to the next LARGER cluster start
@@ -5443,8 +5463,7 @@ impl LayoutEngine {
 
             // Apply BiDi visual reordering if needed
             if has_bidi && !all_glyphs.is_empty() {
-                all_glyphs = bidi::reorder_line_glyphs(all_glyphs, &bidi_levels);
-                bidi::reposition_after_reorder(&mut all_glyphs, 0.0);
+                all_glyphs = bidi::reorder_and_position(all_glyphs, &bidi_levels);
             }
             return all_glyphs;
         }
@@ -5506,8 +5525,7 @@ impl LayoutEngine {
                 }
 
                 // Reorder glyphs visually and reposition
-                let mut glyphs = bidi::reorder_line_glyphs(all_glyphs, &bidi_levels);
-                bidi::reposition_after_reorder(&mut glyphs, 0.0);
+                let glyphs = bidi::reorder_and_position(all_glyphs, &bidi_levels);
                 return glyphs;
             }
 
@@ -5585,8 +5603,7 @@ impl LayoutEngine {
             while levels.len() < glyphs.len() {
                 levels.push(unicode_bidi::Level::ltr());
             }
-            glyphs = bidi::reorder_line_glyphs(glyphs, &levels);
-            bidi::reposition_after_reorder(&mut glyphs, 0.0);
+            glyphs = bidi::reorder_and_position(glyphs, &levels);
         }
 
         glyphs
@@ -5771,8 +5788,7 @@ impl LayoutEngine {
 
         // Apply BiDi visual reordering if needed
         if has_bidi && !glyphs.is_empty() {
-            glyphs = bidi::reorder_line_glyphs(glyphs, &bidi_levels);
-            bidi::reposition_after_reorder(&mut glyphs, 0.0);
+            glyphs = bidi::reorder_and_position(glyphs, &bidi_levels);
         }
 
         glyphs
@@ -5784,7 +5800,7 @@ impl LayoutEngine {
         &self,
         shaped: &[shaping::ShapedGlyph],
         chars: &[char],
-        _char_positions: &[f64],
+        char_positions: &[f64],
         scale: f64,
         font_size: f64,
         font_family: &str,
@@ -5797,14 +5813,19 @@ impl LayoutEngine {
     ) -> Vec<PositionedGlyph> {
         let mut result = Vec::with_capacity(shaped.len());
         let mut x = 0.0_f64;
+        let mut cluster_pen = 0.0_f64;
+        let mut prev_cluster: Option<usize> = None;
 
         let clusters = cluster_texts(shaped, chars);
         for (sg, (cluster_text, ligature)) in shaped.iter().zip(clusters) {
             let cluster = sg.cluster as usize;
             let char_value = chars.get(cluster).copied().unwrap_or(' ');
 
-            // Use shaped position
-            let glyph_x = x + sg.x_offset as f64 * scale;
+            if prev_cluster != Some(cluster) {
+                cluster_pen = x;
+                prev_cluster = Some(cluster);
+            }
+            let glyph_x = shaped_glyph_x(char_positions, cluster, x, cluster_pen, sg, scale);
             let glyph_y = sg.y_offset as f64 * scale;
             let advance = sg.x_advance as f64 * scale + letter_spacing;
 
@@ -5842,9 +5863,12 @@ impl LayoutEngine {
         scale: f64,
     ) -> Vec<PositionedGlyph> {
         let mut result = Vec::with_capacity(shaped.len());
-        // Use the first char position as the base offset for this run
+        // Run-relative pen, used only for offsets inside a cluster and when a
+        // cluster has no Knuth-Plass position; positions are line-absolute.
         let base_x = char_positions.first().copied().unwrap_or(0.0);
         let mut x = 0.0_f64;
+        let mut cluster_pen = 0.0_f64;
+        let mut prev_cluster: Option<usize> = None;
 
         let clusters = cluster_texts(shaped, chars);
         for (sg, (cluster_text, ligature)) in shaped.iter().zip(clusters) {
@@ -5852,7 +5876,15 @@ impl LayoutEngine {
             let sc = styled_chars.get(cluster).unwrap_or(&styled_chars[0]);
             let char_value = chars.get(cluster).copied().unwrap_or(' ');
 
-            let glyph_x = base_x + x + sg.x_offset as f64 * scale;
+            if prev_cluster != Some(cluster) {
+                cluster_pen = x;
+                prev_cluster = Some(cluster);
+            }
+            let glyph_x = if char_positions.get(cluster).is_some() {
+                shaped_glyph_x(char_positions, cluster, x, cluster_pen, sg, scale)
+            } else {
+                base_x + x + sg.x_offset as f64 * scale
+            };
             let glyph_y = sg.y_offset as f64 * scale;
             let advance = sg.x_advance as f64 * scale + sc.letter_spacing;
 

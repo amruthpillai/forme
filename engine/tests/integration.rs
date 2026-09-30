@@ -15506,3 +15506,341 @@ fn test_a_link_nested_inside_the_same_link_does_not_warn() {
         "no loss, no warning: {warnings:?}"
     );
 }
+
+// ─── Glyph positioning: registered fonts are drawn as laid out ────────
+
+/// Lay out `node` with Liberation Sans registered as "Liberation" and
+/// return each text line's (left, ink right, glyphs).
+fn liberation_lines(node: Node) -> Vec<(f64, f64, Vec<forme::layout::PositionedGlyph>)> {
+    let font = std::fs::read("../packages/fonts-standard/fonts/LiberationSans-Regular.ttf")
+        .expect("Liberation Sans in the repo");
+    let mut font_context = FontContext::new();
+    font_context
+        .registry_mut()
+        .register("Liberation", 400, false, font);
+    let doc = default_doc(vec![node]);
+    let pages = LayoutEngine::new().layout(&doc, &font_context);
+    fn walk(
+        els: &[forme::layout::LayoutElement],
+        out: &mut Vec<(f64, f64, Vec<forme::layout::PositionedGlyph>)>,
+    ) {
+        for el in els {
+            if let forme::layout::DrawCommand::Text { lines, .. } = &el.draw {
+                for l in lines {
+                    let right = l
+                        .glyphs
+                        .iter()
+                        .filter(|g| g.char_value != ' ')
+                        .map(|g| l.x + g.x_offset + g.x_advance)
+                        .fold(f64::MIN, f64::max);
+                    out.push((l.x, right, l.glyphs.clone()));
+                }
+            }
+            walk(&el.children, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&pages[0].elements, &mut out);
+    out
+}
+
+fn liberation_justified_paragraph() -> Node {
+    let mut text = make_text(
+        "The quick brown fox jumps over the lazy dog and keeps running across the field until the end.",
+        11.0,
+    );
+    text.style.font_family = Some("Liberation".to_string());
+    text.style.text_align = Some(TextAlign::Justify);
+    Node {
+        kind: NodeKind::View,
+        style: Style {
+            width: Some(Dimension::Pt(220.0)),
+            ..Default::default()
+        },
+        children: vec![text],
+        id: None,
+        source_location: None,
+        bookmark: None,
+        href: None,
+        alt: None,
+    }
+}
+
+/// The shaped (registered-font) path ignored the Knuth-Plass positions, so
+/// its glyph offsets were natural while the standard-font path's included
+/// justification: a justified line in Liberation Sans ended at 263pt in a
+/// 274pt box. Every justified line but the last must reach the edge.
+#[test]
+fn test_shaped_justified_lines_reach_the_edge_in_layout() {
+    let lines = liberation_lines(liberation_justified_paragraph());
+    assert!(lines.len() >= 3, "a multi-line paragraph");
+    for (_, right, _) in &lines[..lines.len() - 1] {
+        assert!(
+            (right - 274.0).abs() < 0.05,
+            "a justified line ends at the 274pt edge, got {right:.2}"
+        );
+    }
+}
+
+/// Render `node` with Liberation Sans embedded as "Liberation".
+fn liberation_pdf(node: Node) -> Vec<u8> {
+    use base64::Engine as _;
+    let font = std::fs::read("../packages/fonts-standard/fonts/LiberationSans-Regular.ttf")
+        .expect("Liberation Sans in the repo");
+    let mut doc = default_doc(vec![node]);
+    doc.fonts = vec![FontEntry {
+        family: "Liberation".into(),
+        src: base64::engine::general_purpose::STANDARD.encode(&font),
+        weight: 400,
+        italic: false,
+    }];
+    render_to_pdf(&doc)
+}
+
+/// Where each text line of the (single) registered font is DRAWN to: replays
+/// the content stream's Tf / Tc / Td / Tj / TJ against the font's /W widths,
+/// as a PDF viewer does. Returns (baseline y, drawn right edge) per text
+/// object, trailing spaces excluded.
+fn drawn_line_ends(pdf: &[u8]) -> Vec<(f64, f64)> {
+    let raw = String::from_utf8_lossy(pdf);
+    // /W [ gid [w] gid [w] ... ] of the CIDFont.
+    let w_at = raw.find("/W [").expect("a CIDFont /W array") + 4;
+    let w_src = &raw[w_at..w_at + raw[w_at..].find(" ]").unwrap()];
+    let nums: Vec<f64> = w_src
+        .replace(['[', ']'], " ")
+        .split_whitespace()
+        .map(|n| n.parse().unwrap())
+        .collect();
+    let widths: std::collections::HashMap<u16, f64> =
+        nums.chunks(2).map(|c| (c[0] as u16, c[1])).collect();
+    let stream = decompress_pdf_streams(pdf);
+    let (mut size, mut tc, mut x, mut y) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+    let mut out = Vec::new();
+    let mut ink_end = f64::MIN;
+    let mut in_bt = false;
+    let show = |hex: &str, x: &mut f64, ink_end: &mut f64, size: f64, tc: f64| {
+        for i in (0..hex.len()).step_by(4) {
+            let gid = u16::from_str_radix(&hex[i..i + 4], 16).unwrap();
+            let w = widths.get(&gid).copied().unwrap_or(0.0) * size / 1000.0;
+            // gid for a space advances but leaves no ink; Liberation's space
+            // is narrow, so treat any glyph as ink except the pen's last
+            // trailing advance (callers render text without trailing spaces).
+            *x += w;
+            *ink_end = x.max(*ink_end);
+            *x += tc;
+        }
+    };
+    for line in stream.lines() {
+        let t = line.trim();
+        if t == "BT" {
+            in_bt = true;
+            ink_end = f64::MIN;
+            x = 0.0;
+            y = 0.0;
+        } else if t == "ET" {
+            if in_bt && ink_end > f64::MIN {
+                out.push((y, ink_end));
+            }
+            in_bt = false;
+        } else if let Some(v) = t.strip_suffix(" Tc") {
+            tc = v.trim().parse().unwrap();
+        } else if t.ends_with(" Tf") {
+            size = t.split_whitespace().nth(1).unwrap().parse().unwrap();
+        } else if let Some(v) = t.strip_suffix(" Td") {
+            let p: Vec<f64> = v.split_whitespace().map(|n| n.parse().unwrap()).collect();
+            x += p[0];
+            y += p[1];
+        } else if let Some(v) = t.strip_suffix(" Tj") {
+            let hex = v.trim().trim_start_matches('<').trim_end_matches('>');
+            let mut pen = x;
+            show(hex, &mut pen, &mut ink_end, size, tc);
+            // Td is relative to the line start, not the pen.
+        } else if let Some(v) = t.strip_suffix(" TJ") {
+            let body = v.trim().trim_start_matches('[').trim_end_matches(']');
+            let mut pen = x;
+            let mut rest = body;
+            while !rest.trim().is_empty() {
+                let r = rest.trim_start();
+                if let Some(after) = r.strip_prefix('<') {
+                    let end = after.find('>').unwrap();
+                    show(&after[..end], &mut pen, &mut ink_end, size, tc);
+                    rest = &after[end + 1..];
+                } else {
+                    let end = r
+                        .find(|c: char| c == '<' || c.is_whitespace())
+                        .unwrap_or(r.len());
+                    let n: f64 = r[..end].parse().unwrap();
+                    pen -= n * size / 1000.0;
+                    rest = &r[end..];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Kerning from the shaper sets layout's positions, but plain `Tj` draws
+/// with the font's widths, so the kerning never reached the page: this 24pt
+/// line was drawn 17.8pt wider than laid out (406.55pt vs 424.39pt).
+#[test]
+fn test_registered_font_kerning_is_drawn_where_laid_out() {
+    let mut text = make_text("AVAWAY To Tomorrow Wave LTA", 24.0);
+    text.style.font_family = Some("Liberation".to_string());
+    let laid_out = liberation_lines(text.clone())[0].1;
+    let drawn = drawn_line_ends(&liberation_pdf(text));
+    assert_eq!(drawn.len(), 1, "one text object: {drawn:?}");
+    assert!(
+        (drawn[0].1 - laid_out).abs() < 0.05,
+        "drawn to {:.2}pt, laid out to {laid_out:.2}pt",
+        drawn[0].1
+    );
+}
+
+/// Registered fonts are Type0 / Identity-H (2-byte), and a viewer applies
+/// Tw only to the single-byte code 32, so justification was never drawn:
+/// the 220pt paragraph's second line ended 11pt short of the edge.
+#[test]
+fn test_registered_font_justification_is_drawn_to_the_edge() {
+    let drawn = drawn_line_ends(&liberation_pdf(liberation_justified_paragraph()));
+    assert!(drawn.len() >= 3, "{drawn:?}");
+    let mut by_line = drawn.clone();
+    by_line.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    for (_, end) in &by_line[..by_line.len() - 1] {
+        assert!(
+            (end - 274.0).abs() < 0.05,
+            "drawn to {end:.2}pt of 274pt: {by_line:?}"
+        );
+    }
+}
+
+/// A line with nothing to adjust keeps a plain `Tj`.
+#[test]
+fn test_registered_font_text_without_adjustments_keeps_tj() {
+    let mut text = make_text("minimum", 12.0);
+    text.style.font_family = Some("Liberation".to_string());
+    let stream = decompress_pdf_streams(&liberation_pdf(text));
+    assert!(stream.contains("> Tj"), "plain Tj:\n{stream}");
+    assert!(!stream.contains(" TJ"), "no TJ array:\n{stream}");
+}
+
+/// A Hebrew point is a zero-width glyph the shaper moves over its base
+/// letter (GPOS mark positioning). The BiDi reposition rebuilt x from
+/// advances alone and dropped that offset, so the qamats of שָׁלוֹם sat at
+/// the left edge of ש instead of under it. For one RTL run, layout must put
+/// every glyph exactly where the shaper does, read in visual order.
+#[test]
+fn test_rtl_marks_keep_the_shapers_offsets() {
+    let font =
+        std::fs::read("../packages/fonts-standard/fonts/LiberationSans-Regular.ttf").unwrap();
+    let face = ttf_parser::Face::parse(&font, 0).unwrap();
+    let scale = 40.0 / face.units_per_em() as f64;
+    // The shaper returns logical order; visual order is its reverse.
+    let mut shaped = forme::text::shaping::shape_text_with_direction("שָׁלוֹם", &font, true).unwrap();
+    shaped.reverse();
+    let mut pen = 0.0;
+    let expected: Vec<(u16, f64)> = shaped
+        .iter()
+        .map(|g| {
+            let x = pen + g.x_offset as f64 * scale;
+            pen += g.x_advance as f64 * scale;
+            (g.glyph_id, x)
+        })
+        .collect();
+    assert!(
+        shaped.iter().any(|g| g.x_advance == 0 && g.x_offset != 0),
+        "precondition: a zero-width mark the shaper offsets"
+    );
+
+    let mut text = make_text("שָׁלוֹם", 40.0);
+    text.style.font_family = Some("Liberation".to_string());
+    text.style.direction = Some(Direction::Rtl);
+    let lines = liberation_lines(text);
+    let got: Vec<(u16, f64)> = lines[0]
+        .2
+        .iter()
+        .map(|g| (g.glyph_id, g.x_offset))
+        .collect();
+    let start = got[0].1 - expected[0].1;
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "same glyphs: {got:?} vs {expected:?}"
+    );
+    for ((gid, x), (egid, ex)) in got.iter().zip(&expected) {
+        assert_eq!(gid, egid, "glyph order: {got:?} vs {expected:?}");
+        assert!(
+            (x - start - ex).abs() < 0.01,
+            "glyph {gid} at {x:.2}, shaper puts it at {:.2}: {got:?}",
+            ex + start
+        );
+    }
+}
+
+/// The shaper can move a mark vertically (Liberation lowers the stacked
+/// marks of "q̣̇" by 410 units, 8.01pt at 40pt), and the writer never read
+/// a glyph's y offset, so the mark was drawn 8pt off. It is drawn with a
+/// text rise around it, reset afterwards.
+#[test]
+fn test_registered_font_vertical_mark_offsets_are_drawn() {
+    let mut text = make_text("q\u{323}\u{307}", 40.0);
+    text.style.font_family = Some("Liberation".to_string());
+    let glyphs = &liberation_lines(text.clone())[0].2;
+    let rise = glyphs
+        .iter()
+        .map(|g| g.y_offset)
+        .find(|y| y.abs() > 0.001)
+        .expect("precondition: the shaper lowers a mark");
+    let stream = decompress_pdf_streams(&liberation_pdf(text));
+    let rises: Vec<f64> = stream
+        .lines()
+        .filter_map(|l| l.trim().strip_suffix(" Ts"))
+        .map(|v| v.trim().parse().unwrap())
+        .collect();
+    assert!(
+        rises.iter().any(|r| (r - rise).abs() < 0.01),
+        "a Ts of {rise:.2} for the mark, got {rises:?}:\n{stream}"
+    );
+    assert_eq!(
+        rises.last().copied(),
+        Some(0.0),
+        "the rise is reset: {rises:?}"
+    );
+}
+
+/// Redaction locates text by replaying the content stream. With registered
+/// fonts now drawn as positioned TJ arrays, the region it finds for a word
+/// must start where the word is drawn (its layout position), or a
+/// redaction box would miss kerned or justified text.
+#[test]
+fn test_redaction_finds_text_drawn_with_tj_where_it_is_drawn() {
+    let mut text = make_text("AVAWAY Secret Tomorrow", 24.0);
+    text.style.font_family = Some("Liberation".to_string());
+    let (line_x, _, glyphs) = liberation_lines(text.clone()).remove(0);
+    let secret_x = line_x
+        + glyphs
+            .iter()
+            .find(|g| g.char_value == 'S')
+            .expect("the S of Secret")
+            .x_offset;
+    let pdf = liberation_pdf(text);
+    assert!(
+        decompress_pdf_streams(&pdf).contains(" TJ"),
+        "precondition: drawn with TJ"
+    );
+    let regions = forme::find_text_regions(
+        &pdf,
+        &[RedactionPattern {
+            pattern: "Secret".into(),
+            pattern_type: PatternType::Literal,
+            page: None,
+            color: None,
+        }],
+    )
+    .expect("search");
+    assert_eq!(regions.len(), 1, "one match: {regions:?}");
+    assert!(
+        (regions[0].x - secret_x).abs() < 0.5,
+        "region starts at {:.2}, Secret is drawn at {secret_x:.2}",
+        regions[0].x
+    );
+}

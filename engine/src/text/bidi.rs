@@ -198,16 +198,33 @@ pub fn reorder_line_glyphs(
     glyphs
 }
 
-/// Reposition glyphs after visual reordering.
+/// Reorder a line's glyphs for display (`reorder_line_glyphs`) and lay them
+/// out left to right, keeping each glyph's offset from its own pen.
 ///
-/// After `reorder_line_glyphs`, x_offsets still reflect logical order.
-/// This recalculates x positions from left to right based on advance widths.
-pub fn reposition_after_reorder(glyphs: &mut [PositionedGlyph], start_x: f64) {
-    let mut x = start_x;
+/// Glyphs arrive in logical order with `x_offset` = pen + the shaper's own
+/// offset (GPOS). Rebuilding x from advances alone dropped that offset, so a
+/// Hebrew point, a zero-width glyph the shaper moves under its letter, sat
+/// at the letter's edge instead. The offset is taken relative to the pen in
+/// the incoming order and re-applied after reordering. For an RTL run this
+/// is the shaper's own visual order, the one its offsets were made for.
+pub fn reorder_and_position(
+    glyphs: Vec<PositionedGlyph>,
+    levels: &[Level],
+) -> Vec<PositionedGlyph> {
+    let mut glyphs = glyphs;
+    let mut pen = 0.0;
     for g in glyphs.iter_mut() {
-        g.x_offset = x;
-        x += g.x_advance;
+        let own = g.x_offset - pen;
+        pen += g.x_advance;
+        g.x_offset = own;
     }
+    let mut glyphs = reorder_line_glyphs(glyphs, levels);
+    let mut pen = 0.0;
+    for g in glyphs.iter_mut() {
+        g.x_offset += pen;
+        pen += g.x_advance;
+    }
+    glyphs
 }
 
 /// Build a byte-offset → char-index map for a string.
