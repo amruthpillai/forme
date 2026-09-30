@@ -1,7 +1,7 @@
 {
   "version": 1,
   "producer": "formepdf",
-  "createdAt": "2026-09-09T18:11:46.426Z",
+  "createdAt": "2026-09-29T22:06:58.417Z",
   "pageCount": 3,
   "pages": [
     {
@@ -1348,8 +1348,8 @@
       },
       "order": 46,
       "parentId": "0:row:3",
-      "text": "Business Card Design - front and back, print- ready files",
-      "normText": "business card design - front and back, print- ready files",
+      "text": "Business Card Design - front and back, print-ready files",
+      "normText": "business card design - front and back, print-ready files",
       "font": {
         "size": 12,
         "weight": 400,
@@ -4629,5 +4629,5 @@
       "confidence": 1
     }
   ],
-  "contentHash": "sha256:6a3d311c7e433ac33dc42c30e671a3fa86908d98192fe84eaeba7cf3307dd8a1"
+  "contentHash": "sha256:46ef03c4936197e9be65aa8ca3886d913db01a5a7c0ace7740d48548dfc7854a"
 }

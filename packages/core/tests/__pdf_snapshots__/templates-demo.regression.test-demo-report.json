@@ -1,7 +1,7 @@
 {
   "version": 1,
   "producer": "formepdf",
-  "createdAt": "2026-09-17T15:42:09.421Z",
+  "createdAt": "2026-09-29T22:06:58.512Z",
   "pageCount": 7,
   "pages": [
     {
@@ -1265,8 +1265,8 @@
       },
       "order": 6,
       "parentId": null,
-      "text": "Customer retention remained above target at 94.2%, reflecting continued investment in support infrastructure and product reliability. Net new customer acquisition grew 22% year-over-year, with particular strength in the mid-market segment where our competitive positioning improved substantially.",
-      "normText": "customer retention remained above target at 94.2%, reflecting continued investment in support infrastructure and product reliability. net new customer acquisition grew 22% year-over-year, with particular strength in the mid-market segment where our competitive positioning improved substantially.",
+      "text": "Customer retention remained above target at 94.2%, reflecting continued investment in support infrastructure and product reliability. Net new customer acquisition grew 22% year-over-year, with particular strength in the mid- market segment where our competitive positioning improved substantially.",
+      "normText": "customer retention remained above target at 94.2%, reflecting continued investment in support infrastructure and product reliability. net new customer acquisition grew 22% year-over-year, with particular strength in the mid- market segment where our competitive positioning improved substantially.",
       "font": {
         "size": 10,
         "weight": 400,
@@ -1793,8 +1793,8 @@
       },
       "order": 5,
       "parentId": null,
-      "text": "The following table summarizes quarterly revenue (in millions) by operating region for fiscal year 2025. The Pacific Northwest remains our strongest market, while the Southeast showed the highest growth rate at 34% year-over- year.",
-      "normText": "the following table summarizes quarterly revenue (in millions) by operating region for fiscal year 2025. the pacific northwest remains our strongest market, while the southeast showed the highest growth rate at 34% year-over- year.",
+      "text": "The following table summarizes quarterly revenue (in millions) by operating region for fiscal year 2025. The Pacific Northwest remains our strongest market, while the Southeast showed the highest growth rate at 34% year-over-year.",
+      "normText": "the following table summarizes quarterly revenue (in millions) by operating region for fiscal year 2025. the pacific northwest remains our strongest market, while the southeast showed the highest growth rate at 34% year-over-year.",
       "font": {
         "size": 10,
         "weight": 400,
@@ -6802,5 +6802,5 @@
       "confidence": 1
     }
   ],
-  "contentHash": "sha256:1dd85a5df61f384acca368509d519eb6eabc058d9d75874b369d3d5d4b337a45"
+  "contentHash": "sha256:613aebbb3c034c7bb29330f7f1afc6f4744537c677da96ae7bb6dd7d68ff1d5a"
 }
