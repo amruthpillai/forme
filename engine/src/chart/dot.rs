@@ -31,10 +31,25 @@ pub fn build(
     // Legend space
     let legend_width = if config.show_legend { 80.0 } else { 0.0 };
 
-    let plot_left = Y_AXIS_WIDTH;
+    // An axis title gets its own line of room: the y title a column left of
+    // the tick numbers, the x title a row below them. Without one the plot
+    // keeps its old geometry.
+    let title_room = AXIS_LABEL_FONT + LABEL_MARGIN;
+    let y_title_room = if config.y_label.is_some() {
+        title_room
+    } else {
+        0.0
+    };
+    let x_title_room = if config.x_label.is_some() {
+        title_room
+    } else {
+        0.0
+    };
+
+    let plot_left = Y_AXIS_WIDTH + y_title_room;
     let plot_top = LABEL_MARGIN;
     let plot_right = width - LABEL_MARGIN - legend_width;
-    let plot_bottom = height - X_AXIS_HEIGHT;
+    let plot_bottom = height - X_AXIS_HEIGHT - x_title_room;
     let plot_width = plot_right - plot_left;
     let plot_height = plot_bottom - plot_top;
 
@@ -144,7 +159,17 @@ pub fn build(
         }
     }
 
-    // Axis labels
+    // Axis titles
+    if let Some(ref label) = config.y_label {
+        // `yLabel` was accepted and documented but never drawn.
+        primitives.push(ChartPrimitive::VerticalLabel {
+            text: label.clone(),
+            x: AXIS_LABEL_FONT / 2.0 + 1.0,
+            y: plot_top + plot_height / 2.0,
+            font_size: AXIS_LABEL_FONT,
+            color: LABEL_COLOR,
+        });
+    }
     if let Some(ref label) = config.x_label {
         primitives.push(ChartPrimitive::Label {
             text: label.clone(),
@@ -185,4 +210,117 @@ pub fn build(
     }
 
     primitives
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn groups() -> Vec<DotPlotGroup> {
+        vec![DotPlotGroup {
+            name: "p50".to_string(),
+            color: None,
+            data: vec![(1.0, 120.0), (2.0, 340.0), (3.0, 910.0)],
+        }]
+    }
+
+    fn config(x_label: Option<&str>, y_label: Option<&str>) -> DotPlotConfig {
+        DotPlotConfig {
+            x_min: None,
+            x_max: None,
+            y_min: None,
+            y_max: None,
+            x_label: x_label.map(str::to_string),
+            y_label: y_label.map(str::to_string),
+            show_legend: false,
+            dot_size: 3.0,
+        }
+    }
+
+    /// Left edges of the right-anchored y tick labels.
+    fn tick_label_left_edges(p: &[ChartPrimitive]) -> Vec<f64> {
+        p.iter()
+            .filter_map(|p| match p {
+                ChartPrimitive::Label {
+                    text,
+                    x,
+                    font_size,
+                    anchor: TextAnchor::Right,
+                    ..
+                } => Some(x - measure_label(text, *font_size)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `yLabel` was accepted, documented ("Latency (ms)") and never drawn.
+    #[test]
+    fn y_label_is_drawn_vertically_clear_of_the_tick_labels() {
+        let p = build(300.0, 200.0, &groups(), &config(None, Some("Latency (ms)")));
+        let title = p
+            .iter()
+            .find_map(|p| match p {
+                ChartPrimitive::VerticalLabel {
+                    text, x, font_size, ..
+                } => Some((text.clone(), *x, *font_size)),
+                _ => None,
+            })
+            .expect("the y-axis title is drawn");
+        assert_eq!(title.0, "Latency (ms)");
+        let title_right = title.1 + title.2 / 2.0;
+        let ticks_left = tick_label_left_edges(&p)
+            .into_iter()
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            title_right < ticks_left,
+            "title (right edge {title_right:.1}) must clear the tick labels (from {ticks_left:.1})"
+        );
+    }
+
+    /// `xLabel` sat 6pt below the tick labels inside the same 20pt band, so
+    /// the two touched. With a title the plot keeps a line of room for it.
+    #[test]
+    fn x_label_has_its_own_line_below_the_tick_labels() {
+        let p = build(300.0, 200.0, &groups(), &config(Some("Run"), None));
+        let baseline = |want_center: bool, text_is_title: bool| -> f64 {
+            p.iter()
+                .filter_map(|p| match p {
+                    ChartPrimitive::Label {
+                        text,
+                        y,
+                        anchor: TextAnchor::Center,
+                        ..
+                    } if want_center && (text == "Run") == text_is_title => Some(*y),
+                    _ => None,
+                })
+                .fold(f64::MIN, f64::max)
+        };
+        let ticks = baseline(true, false);
+        let title = baseline(true, true);
+        // The title's cap height (~0.72em) must start below the tick
+        // labels' descenders (~0.21em).
+        let gap = (title - AXIS_LABEL_FONT * 0.72) - (ticks + AXIS_LABEL_FONT * 0.21);
+        assert!(gap >= 2.0, "x title crowds the tick labels: gap {gap:.2}pt");
+    }
+
+    #[test]
+    fn no_titles_leaves_the_plot_where_it_was() {
+        let p = build(300.0, 200.0, &groups(), &config(None, None));
+        assert!(!p
+            .iter()
+            .any(|p| matches!(p, ChartPrimitive::VerticalLabel { .. })));
+        // The y axis still starts at Y_AXIS_WIDTH.
+        let axis_x = p
+            .iter()
+            .find_map(|p| match p {
+                ChartPrimitive::Line { x1, x2, width, .. }
+                    if (x1 - x2).abs() < 1e-9 && *width == 1.0 =>
+                {
+                    Some(*x1)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(axis_x, Y_AXIS_WIDTH);
+    }
 }

@@ -71,6 +71,15 @@ pub enum ChartPrimitive {
         color: Color,
         anchor: TextAnchor,
     },
+    /// A text label rotated to read bottom to top, centred on (x, y): a
+    /// y-axis title.
+    VerticalLabel {
+        text: String,
+        x: f64,
+        y: f64,
+        font_size: f64,
+        color: Color,
+    },
 }
 
 /// Text horizontal alignment for labels.
