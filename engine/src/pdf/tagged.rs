@@ -191,6 +191,8 @@ impl TagBuilder {
     /// tagging it. Call `end_element` after the content is written either
     /// way.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub fn begin_element(
         &mut self,
         node_type: &str,
@@ -201,6 +203,39 @@ impl TagBuilder {
         col_span: u32,
         list_numbering: Option<&'static str>,
         actual_text: Option<&str>,
+    ) -> Option<u32> {
+        self.begin_element_as(
+            node_type,
+            is_header_row,
+            alt,
+            page_idx,
+            href,
+            col_span,
+            list_numbering,
+            actual_text,
+            false,
+        )
+    }
+
+    /// `begin_element`, for an element that may be a `wrapper`: one whose
+    /// content is all in its children (its own draw is nothing, or a box
+    /// the caller marks /Artifact). A wrapper gets its structure element but
+    /// no MCID. Giving it one left its marked content open around all its
+    /// children, so every child's MCID sequence was nested inside it (133 of
+    /// 134 on the invoice fixture) and a cell's text belonged to both its TD
+    /// and the TR around it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_element_as(
+        &mut self,
+        node_type: &str,
+        is_header_row: bool,
+        alt: Option<&str>,
+        page_idx: usize,
+        href: Option<&str>,
+        col_span: u32,
+        list_numbering: Option<&'static str>,
+        actual_text: Option<&str>,
+        wrapper: bool,
     ) -> Option<u32> {
         // An element carrying an href is a link: it tags as a /Link structure
         // element (overriding its node_type role) so the annotation can attach
@@ -258,7 +293,8 @@ impl TagBuilder {
         // attribute upward to its nearest structural ancestor — which then
         // violates that ancestor's containment rule. Neither gets an MCID;
         // the caller marks their own ink (borders, backgrounds) /Artifact.
-        let skip_mcid = self.ua2 && (Self::role_forbids_content(role) || role == "Div");
+        let skip_mcid =
+            wrapper || (self.ua2 && (Self::role_forbids_content(role) || role == "Div"));
 
         let mcid = if skip_mcid {
             None

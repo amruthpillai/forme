@@ -13267,11 +13267,16 @@ fn pdfua2_grouping_elements_contain_no_content_items() {
             "{marker} element must hold no marked content: {body}"
         );
     }
-    // The UA-1 shape keeps its historical fused MCIDs — control.
+    // UA-1 used to keep a fused MCID on the Table, open around every cell
+    // (nested marked content). A wrapper gets no MCID in either shape now:
+    // its content is its cells'.
     let bytes17 = forme::render_json(&docua2(r#", "pdfUa": true"#)).unwrap();
     let text17 = String::from_utf8_lossy(&bytes17);
     let body17 = struct_elem_body(&text17, "/S /Table ");
-    assert!(body17.contains("/MCR"), "UA-1 shape unchanged");
+    assert!(
+        !body17.contains("/MCR"),
+        "UA-1 Table holds no content items of its own: {body17}"
+    );
 }
 
 #[test]
