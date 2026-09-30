@@ -4360,51 +4360,40 @@ impl PdfWriter {
     }
 
     /// Contiguous runs of glyphs on one line that share a per-glyph href,
-    /// with the x extent they are actually drawn at. Positions mirror the
-    /// text writer (style groups placed at `x_cursor`, `Tw` added per space)
-    /// so the annotation lands on the ink, justified lines included.
+    /// with the x extent they are drawn at. A glyph's offset already
+    /// includes justification and `wordSpacing` (Tw only makes the drawn
+    /// text match it), so it is used as is. Adding Tw per space again here
+    /// put a justified line's link rect up to 6pt past its text (#162's
+    /// mistake, in a second place).
     fn inline_link_spans(line: &TextLine) -> Vec<InlineLinkSpan> {
         let mut spans: Vec<InlineLinkSpan> = Vec::new();
         if !line.glyphs.iter().any(|g| g.href.is_some()) {
             return spans;
         }
-        let mut x_cursor = line.x;
         let mut prev_href: Option<&str> = None;
-        for group in Self::group_glyphs_by_style(&line.glyphs) {
-            let first = group[0];
-            let mut spaces = 0usize;
-            for g in &group {
-                let x0 =
-                    x_cursor + (g.x_offset - first.x_offset) + spaces as f64 * line.word_spacing;
-                let x1 = x0 + g.x_advance;
-                if g.char_value == ' ' {
-                    spaces += 1;
+        for g in &line.glyphs {
+            let x0 = line.x + g.x_offset;
+            let x1 = x0 + g.x_advance;
+            let href = g.href.as_deref().filter(|h| !h.is_empty());
+            if let Some(h) = href {
+                if prev_href != Some(h) {
+                    spans.push(InlineLinkSpan {
+                        href: h.to_string(),
+                        x0: f64::INFINITY,
+                        x1: f64::NEG_INFINITY,
+                    });
                 }
-                let href = g.href.as_deref().filter(|h| !h.is_empty());
-                if let Some(h) = href {
-                    if prev_href != Some(h) {
-                        spans.push(InlineLinkSpan {
-                            href: h.to_string(),
-                            x0: f64::INFINITY,
-                            x1: f64::NEG_INFINITY,
-                        });
-                    }
-                    // Only ink extends the rect: a space at a span's edge
-                    // (the one a wrapped line ends on, or "docs " in the
-                    // source) would widen the target past the text.
-                    if !g.char_value.is_whitespace() {
-                        if let Some(last) = spans.last_mut() {
-                            last.x0 = last.x0.min(x0);
-                            last.x1 = last.x1.max(x1);
-                        }
+                // Only ink extends the rect: a space at a span's edge
+                // (the one a wrapped line ends on, or "docs " in the
+                // source) would widen the target past the text.
+                if !g.char_value.is_whitespace() {
+                    if let Some(last) = spans.last_mut() {
+                        last.x0 = last.x0.min(x0);
+                        last.x1 = last.x1.max(x1);
                     }
                 }
-                prev_href = href;
             }
-            if let Some(last) = group.last() {
-                x_cursor =
-                    line.x + last.x_offset + last.x_advance + spaces as f64 * line.word_spacing;
-            }
+            prev_href = href;
         }
         // A span of nothing but spaces has no ink to link.
         spans.retain(|s| s.x1 > s.x0);

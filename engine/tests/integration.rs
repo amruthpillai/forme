@@ -15265,3 +15265,29 @@ fn test_justified_multi_style_line_reaches_the_right_edge() {
         );
     }
 }
+
+/// Glyph offsets on a justified line already include the justification.
+/// The link-rect pass added word spacing per space on top (the #162
+/// mistake, in a second place), so on a justified line an inline link's
+/// clickable area was shifted and too wide. A paragraph that is one link
+/// gets a rect per line, and every stretched line fills the box, so its
+/// rect must end at the right edge (54 + 220) and never pass it.
+#[test]
+fn test_inline_link_rects_on_justified_lines_match_the_text() {
+    let runs = r#"{ "content": "The quick brown fox jumps over the lazy dog and keeps running across the field until the end.", "href": "https://example.com/j" }"#;
+    let style = r#", "width": { "Pt": 220 }, "textAlign": "Justify""#;
+    let bytes = forme::render_json(&inline_link_json(style, runs, None, false)).unwrap();
+    let mut links = parse_link_annotations(&bytes);
+    assert!(links.len() >= 3, "a rect per line, got {links:?}");
+    links.sort_by(|a, b| b.rect[1].partial_cmp(&a.rect[1]).unwrap());
+    for l in &links[..links.len() - 1] {
+        assert!(
+            (l.rect[2] - 274.0).abs() < 0.5,
+            "a justified line's link rect should end at 274, got {:?}",
+            l.rect
+        );
+    }
+    for l in &links {
+        assert!(l.rect[2] <= 274.0 + 0.5, "rect past the box: {:?}", l.rect);
+    }
+}
