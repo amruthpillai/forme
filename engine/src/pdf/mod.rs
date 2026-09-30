@@ -5340,6 +5340,26 @@ fn pdf_escape_string(s: &str) -> String {
     out
 }
 
+/// A group carrying page-number sentinels, which is drawn from the
+/// substituted text rather than from its glyphs' positions.
+fn has_placeholder_group(group: &[&PositionedGlyph]) -> bool {
+    group
+        .iter()
+        .any(|g| g.char_value == PAGE_NUMBER_SENTINEL || g.char_value == TOTAL_PAGES_SENTINEL)
+}
+
+/// A PDF number with at most three decimals and no trailing zeros
+/// (556.152 -> "556.152", 556.0 -> "556").
+fn pdf_number(v: f64) -> String {
+    let s = format!("{:.3}", v);
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s.is_empty() || s == "-" {
+        "0".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5886,25 +5906,5 @@ mod tests {
             !text.contains("CIDFontType2"),
             "Standard font should not use CIDFontType2"
         );
-    }
-}
-
-/// A group carrying page-number sentinels, which is drawn from the
-/// substituted text rather than from its glyphs' positions.
-fn has_placeholder_group(group: &[&PositionedGlyph]) -> bool {
-    group
-        .iter()
-        .any(|g| g.char_value == PAGE_NUMBER_SENTINEL || g.char_value == TOTAL_PAGES_SENTINEL)
-}
-
-/// A PDF number with at most three decimals and no trailing zeros
-/// (556.152 -> "556.152", 556.0 -> "556").
-fn pdf_number(v: f64) -> String {
-    let s = format!("{:.3}", v);
-    let s = s.trim_end_matches('0').trim_end_matches('.');
-    if s.is_empty() || s == "-" {
-        "0".to_string()
-    } else {
-        s.to_string()
     }
 }
