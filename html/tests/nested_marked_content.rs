@@ -81,7 +81,15 @@ fn no_mcid_sequence_opens_inside_another() {
     assert_eq!(untagged_text, 0, "every text show is still tagged content");
 
     let raw = String::from_utf8_lossy(&out.pdf);
-    for role in ["/S /H1", "/S /Table", "/S /TR", "/S /TD", "/S /L", "/S /LI", "/S /P"] {
+    for role in [
+        "/S /H1",
+        "/S /Table",
+        "/S /TR",
+        "/S /TD",
+        "/S /L",
+        "/S /LI",
+        "/S /P",
+    ] {
         assert!(raw.contains(role), "structure keeps {role}");
     }
 }
