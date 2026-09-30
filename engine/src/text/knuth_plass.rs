@@ -706,14 +706,19 @@ pub fn reconstruct_lines(
                     if item_idx == sol.break_item {
                         continue;
                     }
+                    // Draw the space at its own width: the glue's width may
+                    // also carry the letter-spacing hung off the previous
+                    // word (hang_trailing_letter_spacing), which that word's
+                    // characters already advance by.
+                    let natural = char_widths.get(*char_index).copied().unwrap_or(*width);
                     let adjusted = if apply_justify {
                         if sol.adjustment_ratio >= 0.0 {
-                            width + sol.adjustment_ratio * stretch
+                            natural + sol.adjustment_ratio * stretch
                         } else {
-                            width + sol.adjustment_ratio * shrink
+                            natural + sol.adjustment_ratio * shrink
                         }
                     } else {
-                        *width
+                        natural
                     };
                     if *char_index < chars.len() {
                         line_chars.push(chars[*char_index]);
@@ -764,6 +769,60 @@ pub fn reconstruct_lines(
     }
 
     lines
+}
+
+/// Keep the letter-spacing after a line's last character from deciding
+/// whether the line fits.
+///
+/// `char_widths` carry each character's letter-spacing, the last one's
+/// included, but the spacing after the final character paints nothing and
+/// Chrome does not let it push a word to the next line. A 0.17em-tracked
+/// caption that fitted its cell once its ink was measured wrapped instead
+/// (the Northmoor certificate). The spacing moves off each box's final
+/// character: into the following glue, which a break consumes, or, at a
+/// penalty, off the penalty's width, which counts only when breaking there.
+/// Mid-line widths are unchanged; rendering still uses `char_widths`.
+pub fn hang_trailing_letter_spacing(items: &mut [Item], letter_spacing_at: impl Fn(usize) -> f64) {
+    for i in 1..items.len() {
+        let (prev, rest) = items.split_at_mut(i);
+        let Item::Box {
+            width: box_width,
+            char_end,
+            ..
+        } = &mut prev[i - 1]
+        else {
+            continue;
+        };
+        let ls = letter_spacing_at(*char_end - 1);
+        if ls == 0.0 {
+            continue;
+        }
+        // The paragraph-ending glue is followed by a forced break, so it is
+        // always on the line: drop the spacing there instead of moving it.
+        let ends_paragraph = matches!(
+            rest.get(1),
+            Some(Item::Penalty { penalty, .. }) if *penalty == f64::NEG_INFINITY
+        );
+        match &mut rest[0] {
+            Item::Glue {
+                width, char_index, ..
+            } if *char_index == *char_end => {
+                *box_width -= ls;
+                if !ends_paragraph {
+                    *width += ls;
+                }
+            }
+            Item::Penalty {
+                width,
+                flagged: false,
+                char_index,
+                ..
+            } if *char_index == *char_end => {
+                *width -= ls;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Make word spaces incompressible, for text that will not be justified.
@@ -851,14 +910,19 @@ pub fn reconstruct_run_lines(
                     if item_idx == sol.break_item {
                         continue;
                     }
+                    // Draw the space at its own width: the glue's width may
+                    // also carry the letter-spacing hung off the previous
+                    // word (hang_trailing_letter_spacing), which that word's
+                    // characters already advance by.
+                    let natural = char_widths.get(*char_index).copied().unwrap_or(*width);
                     let adjusted = if apply_justify {
                         if sol.adjustment_ratio >= 0.0 {
-                            width + sol.adjustment_ratio * stretch
+                            natural + sol.adjustment_ratio * stretch
                         } else {
-                            width + sol.adjustment_ratio * shrink
+                            natural + sol.adjustment_ratio * shrink
                         }
                     } else {
-                        *width
+                        natural
                     };
                     if *char_index < chars.len() {
                         line_chars.push(chars[*char_index].clone());

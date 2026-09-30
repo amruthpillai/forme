@@ -1244,6 +1244,7 @@ impl TextLayout {
         if !justify {
             knuth_plass::disallow_shrink(&mut items);
         }
+        knuth_plass::hang_trailing_letter_spacing(&mut items, |_| letter_spacing);
         let config = knuth_plass::Config {
             line_width: max_width,
             ..Default::default()
@@ -1388,6 +1389,7 @@ impl TextLayout {
         if !justify {
             knuth_plass::disallow_shrink(&mut items);
         }
+        knuth_plass::hang_trailing_letter_spacing(&mut items, |i| chars[i].letter_spacing);
         let config = knuth_plass::Config {
             line_width: max_width,
             ..Default::default()
@@ -2344,6 +2346,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The Northmoor certificate's signature caption: bold 5.25pt uppercase
+    /// with 0.17em letter-spacing in a 119.45pt cell. "... · QUALITY" is
+    /// 119.815pt only because of the letter-spacing after its final Y,
+    /// which paints nothing; Chrome keeps QUALITY on the first line.
+    #[test]
+    fn test_optimal_trailing_letter_spacing_does_not_decide_fit() {
+        let tl = TextLayout::new();
+        let fc = ctx();
+        let lines = tl.break_into_lines_optimal(
+            &fc,
+            "PRIYA N. RAGHUNATHAN · QUALITY SYSTEMS MANAGER",
+            119.45,
+            5.25,
+            "Helvetica",
+            700,
+            FontStyle::Normal,
+            0.8925,
+            0.0,
+            Hyphens::Manual,
+            Some("en"),
+            false,
+        );
+        assert_eq!(lines[0].text.trim_end(), "PRIYA N. RAGHUNATHAN · QUALITY");
     }
 
     #[test]
