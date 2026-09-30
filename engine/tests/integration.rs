@@ -15506,3 +15506,78 @@ fn test_a_link_nested_inside_the_same_link_does_not_warn() {
         "no loss, no warning: {warnings:?}"
     );
 }
+
+// ─── Glyph positioning: registered fonts are drawn as laid out ────────
+
+/// Lay out `node` with Liberation Sans registered as "Liberation" and
+/// return each text line's (left, ink right, glyphs).
+fn liberation_lines(node: Node) -> Vec<(f64, f64, Vec<forme::layout::PositionedGlyph>)> {
+    let font = std::fs::read("../packages/fonts-standard/fonts/LiberationSans-Regular.ttf")
+        .expect("Liberation Sans in the repo");
+    let mut font_context = FontContext::new();
+    font_context
+        .registry_mut()
+        .register("Liberation", 400, false, font);
+    let doc = default_doc(vec![node]);
+    let pages = LayoutEngine::new().layout(&doc, &font_context);
+    fn walk(
+        els: &[forme::layout::LayoutElement],
+        out: &mut Vec<(f64, f64, Vec<forme::layout::PositionedGlyph>)>,
+    ) {
+        for el in els {
+            if let forme::layout::DrawCommand::Text { lines, .. } = &el.draw {
+                for l in lines {
+                    let right = l
+                        .glyphs
+                        .iter()
+                        .filter(|g| g.char_value != ' ')
+                        .map(|g| l.x + g.x_offset + g.x_advance)
+                        .fold(f64::MIN, f64::max);
+                    out.push((l.x, right, l.glyphs.clone()));
+                }
+            }
+            walk(&el.children, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&pages[0].elements, &mut out);
+    out
+}
+
+fn liberation_justified_paragraph() -> Node {
+    let mut text = make_text(
+        "The quick brown fox jumps over the lazy dog and keeps running across the field until the end.",
+        11.0,
+    );
+    text.style.font_family = Some("Liberation".to_string());
+    text.style.text_align = Some(TextAlign::Justify);
+    Node {
+        kind: NodeKind::View,
+        style: Style {
+            width: Some(Dimension::Pt(220.0)),
+            ..Default::default()
+        },
+        children: vec![text],
+        id: None,
+        source_location: None,
+        bookmark: None,
+        href: None,
+        alt: None,
+    }
+}
+
+/// The shaped (registered-font) path ignored the Knuth-Plass positions, so
+/// its glyph offsets were natural while the standard-font path's included
+/// justification: a justified line in Liberation Sans ended at 263pt in a
+/// 274pt box. Every justified line but the last must reach the edge.
+#[test]
+fn test_shaped_justified_lines_reach_the_edge_in_layout() {
+    let lines = liberation_lines(liberation_justified_paragraph());
+    assert!(lines.len() >= 3, "a multi-line paragraph");
+    for (_, right, _) in &lines[..lines.len() - 1] {
+        assert!(
+            (right - 274.0).abs() < 0.05,
+            "a justified line ends at the 274pt edge, got {right:.2}"
+        );
+    }
+}
