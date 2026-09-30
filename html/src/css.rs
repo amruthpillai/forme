@@ -456,7 +456,7 @@ pub(crate) fn apply_declaration(
         }
         "direction" => {
             if let Ok(id) = p.expect_ident() {
-                style.direction = parse_direction(&id);
+                style.direction = parse_direction(id);
             }
         }
         "color" => style.color = parse_color(p),
@@ -1405,6 +1405,17 @@ fn named_color(name: &str) -> Option<Color> {
     Some(Color::hex(hex))
 }
 
+/// `rtl` / `ltr` / `auto` (the HTML `dir` values; CSS `direction` takes the
+/// first two).
+pub fn parse_direction(value: &str) -> Option<forme::style::Direction> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "rtl" => Some(forme::style::Direction::Rtl),
+        "ltr" => Some(forme::style::Direction::Ltr),
+        "auto" => Some(forme::style::Direction::Auto),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1480,16 +1491,5 @@ mod tests {
     fn malformed_declaration_recovers() {
         let (s, _) = parse("color:; font-weight: bold");
         assert_eq!(s.font_weight, Some(700));
-    }
-}
-
-/// `rtl` / `ltr` / `auto` (the HTML `dir` values; CSS `direction` takes the
-/// first two).
-pub fn parse_direction(value: &str) -> Option<forme::style::Direction> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "rtl" => Some(forme::style::Direction::Rtl),
-        "ltr" => Some(forme::style::Direction::Ltr),
-        "auto" => Some(forme::style::Direction::Auto),
-        _ => None,
     }
 }
