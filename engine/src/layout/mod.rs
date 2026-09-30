@@ -5463,8 +5463,7 @@ impl LayoutEngine {
 
             // Apply BiDi visual reordering if needed
             if has_bidi && !all_glyphs.is_empty() {
-                all_glyphs = bidi::reorder_line_glyphs(all_glyphs, &bidi_levels);
-                bidi::reposition_after_reorder(&mut all_glyphs, 0.0);
+                all_glyphs = bidi::reorder_and_position(all_glyphs, &bidi_levels);
             }
             return all_glyphs;
         }
@@ -5526,8 +5525,7 @@ impl LayoutEngine {
                 }
 
                 // Reorder glyphs visually and reposition
-                let mut glyphs = bidi::reorder_line_glyphs(all_glyphs, &bidi_levels);
-                bidi::reposition_after_reorder(&mut glyphs, 0.0);
+                let glyphs = bidi::reorder_and_position(all_glyphs, &bidi_levels);
                 return glyphs;
             }
 
@@ -5605,8 +5603,7 @@ impl LayoutEngine {
             while levels.len() < glyphs.len() {
                 levels.push(unicode_bidi::Level::ltr());
             }
-            glyphs = bidi::reorder_line_glyphs(glyphs, &levels);
-            bidi::reposition_after_reorder(&mut glyphs, 0.0);
+            glyphs = bidi::reorder_and_position(glyphs, &levels);
         }
 
         glyphs
@@ -5791,8 +5788,7 @@ impl LayoutEngine {
 
         // Apply BiDi visual reordering if needed
         if has_bidi && !glyphs.is_empty() {
-            glyphs = bidi::reorder_line_glyphs(glyphs, &bidi_levels);
-            bidi::reposition_after_reorder(&mut glyphs, 0.0);
+            glyphs = bidi::reorder_and_position(glyphs, &bidi_levels);
         }
 
         glyphs
