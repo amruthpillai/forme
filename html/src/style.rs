@@ -54,6 +54,7 @@ pub struct Computed {
     /// Multiplier of font size (CSS lengths are converted).
     pub line_height: Option<f64>,
     pub text_align: Option<TextAlign>,
+    pub direction: Option<forme::style::Direction>,
     pub color: Option<Color>,
     pub background_color: Option<Color>,
     pub text_decoration: Option<TextDecoration>,
@@ -289,6 +290,7 @@ pub fn resolve(css: &CssStyle, parent_font_size: f64, warnings: &mut Vec<String>
         italic: css.italic,
         line_height,
         text_align: css.text_align,
+        direction: css.direction,
         color: css.color,
         background_color: css.background_color,
         text_decoration: css.text_decoration,

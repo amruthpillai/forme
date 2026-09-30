@@ -112,6 +112,9 @@ pub struct CssStyle {
     pub italic: Option<bool>,
     pub line_height: Option<LineHeight>,
     pub text_align: Option<TextAlign>,
+    /// CSS `direction` (also set from the HTML `dir` attribute, as a
+    /// presentational hint below author CSS).
+    pub direction: Option<forme::style::Direction>,
     pub color: Option<Color>,
     pub background_color: Option<Color>,
     pub display: Option<CssDisplay>,
@@ -225,6 +228,7 @@ impl CssStyle {
             italic,
             line_height,
             text_align,
+            direction,
             color,
             background_color,
             display,
@@ -448,6 +452,11 @@ pub(crate) fn apply_declaration(
                     "justify" => Some(TextAlign::Justify),
                     _ => None,
                 };
+            }
+        }
+        "direction" => {
+            if let Ok(id) = p.expect_ident() {
+                style.direction = parse_direction(&id);
             }
         }
         "color" => style.color = parse_color(p),
@@ -1471,5 +1480,16 @@ mod tests {
     fn malformed_declaration_recovers() {
         let (s, _) = parse("color:; font-weight: bold");
         assert_eq!(s.font_weight, Some(700));
+    }
+}
+
+/// `rtl` / `ltr` / `auto` (the HTML `dir` values; CSS `direction` takes the
+/// first two).
+pub fn parse_direction(value: &str) -> Option<forme::style::Direction> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "rtl" => Some(forme::style::Direction::Rtl),
+        "ltr" => Some(forme::style::Direction::Ltr),
+        "auto" => Some(forme::style::Direction::Auto),
+        _ => None,
     }
 }
