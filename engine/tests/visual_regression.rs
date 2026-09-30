@@ -38,7 +38,11 @@ fn pdf_to_pngs(pdf_bytes: &[u8], dpi: u32) -> Vec<Vec<u8>> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_dir = std::env::temp_dir().join(format!("forme_visual_tests_{}", id));
+    // The counter restarts at 0 in every process, so two test runs at once
+    // (two terminals, two CI jobs on one runner) shared forme_visual_tests_0
+    // and one deleted the other's pages mid-read. The pid keeps them apart.
+    let tmp_dir =
+        std::env::temp_dir().join(format!("forme_visual_tests_{}_{}", std::process::id(), id));
     std::fs::create_dir_all(&tmp_dir).unwrap();
 
     let pdf_path = tmp_dir.join("test.pdf");

@@ -1293,6 +1293,22 @@ describe('list children that are not ListItems (issue #161)', () => {
     }
   });
 
+  it('also attaches the warning to the document, for the render warnings', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const doc = parseIn(
+        `<forme-unordered-list props="{}"><forme-list-item props="{}">a</forme-list-item>`
+        + `<forme-view props="{}"></forme-view></forme-unordered-list>`,
+      ) as unknown as Record<symbol, unknown>;
+      const reported = doc[Symbol.for('formepdf.serializerWarnings')] as string[] | undefined;
+      expect(reported).toHaveLength(1);
+      expect(reported![0]).toMatch(/<UnorderedList> dropped <View>/);
+      expect(JSON.stringify(doc)).not.toMatch(/dropped/);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('drops whitespace and comment anchors without a warning', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {

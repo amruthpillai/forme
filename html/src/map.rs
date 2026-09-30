@@ -413,6 +413,12 @@ impl Mapper {
         let inline = parse_style_attr(el.attr("style").unwrap_or(""), &mut self.warnings);
 
         let mut merged = ua_style(&el.tag);
+        // `dir` is a presentational hint (the HTML UA sheet maps it to
+        // `direction`), so it sits below author CSS. The mapper ignored it,
+        // so a dir="rtl" paragraph was laid out left to right.
+        if let Some(d) = el.attr("dir").and_then(crate::css::parse_direction) {
+            merged.direction = Some(d);
+        }
         for r in &matched {
             merged = merged.merge(&r.block.normal);
         }
@@ -1698,6 +1704,7 @@ fn to_engine_style(c: &Computed) -> Style {
     });
     s.line_height = c.line_height;
     s.text_align = c.text_align;
+    s.direction = c.direction;
     s.color = c.color;
     s.background_color = c.background_color;
     s.text_decoration = c.text_decoration;

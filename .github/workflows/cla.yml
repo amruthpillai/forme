@@ -38,3 +38,8 @@ jobs:
           remote-organization-name: 'danmolitor'
           remote-repository-name: 'forme-cla-signatures'
           allowlist: danmolitor,dependabot[bot],*[bot]
+          # The action locks a PR on every `closed` event, merged or not, so
+          # closing and reopening a PR to re-run CI left it locked and this
+          # check then failed ("issue is locked"). Signatures live in
+          # forme-cla-signatures, not in the PR's comments.
+          lock-pullrequest-aftermerge: false

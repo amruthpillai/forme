@@ -154,8 +154,11 @@ pub fn reorder_line_glyphs(
     let min_level = levels.iter().copied().min().unwrap_or(Level::ltr());
     let max_level = levels.iter().copied().max().unwrap_or(Level::ltr());
 
-    // Only reorder if there's actually an RTL level
-    if !max_level.is_rtl() {
+    // Only reorder if some level is RTL. This used to test the HIGHEST
+    // level alone, and LTR text embedded in an RTL paragraph is level 2
+    // (even), so a Hebrew line with a number or a Latin word in it was
+    // never reordered at all and drew in logical order.
+    if !levels.iter().any(|l| l.is_rtl()) {
         return glyphs;
     }
 

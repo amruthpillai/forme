@@ -194,6 +194,24 @@ describe.each(Object.entries(PATHS))('#161 what a list still drops, it warns abo
     expect(String(warn.mock.calls[0][0])).toMatch(/UnorderedList.*View/);
   });
 
+  it('the dropped child is also reported on the document, for the render warnings', () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const doc = serialize(
+      <Document>
+        <Page>
+          <UnorderedList>
+            <ListItem><Text>kept</Text></ListItem>
+            <View><Text>stray</Text></View>
+          </UnorderedList>
+        </Page>
+      </Document>,
+    ) as unknown as Record<symbol, unknown>;
+    const reported = doc[Symbol.for('formepdf.serializerWarnings')] as string[] | undefined;
+    expect(reported).toHaveLength(1);
+    expect(reported![0]).toMatch(/UnorderedList.*View/);
+    expect(JSON.stringify(doc)).not.toMatch(/dropped/);
+  });
+
   it('null, booleans and whitespace in a list are dropped without a warning', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     run(

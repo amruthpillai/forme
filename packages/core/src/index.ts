@@ -436,6 +436,10 @@ export async function renderDocumentWithLayout(element: ReactElement, options?: 
 
 // ── Serialized document rendering ────────────────────────────────────
 
+/** Where the adapters' serializers attach their own warnings (Symbol.for, so
+ * no import of an adapter package is needed). */
+const SERIALIZER_WARNINGS = Symbol.for('formepdf.serializerWarnings');
+
 /**
  * Render a pre-serialized document object (from `serialize()`) to PDF,
  * resolving font sources (file paths, byte arrays) and HTTP image URLs
@@ -477,7 +481,14 @@ export async function renderSerializedDocWithLayout(
   }
   applyAttachmentOptions(doc, options);
   await Promise.all([resolveFonts(doc), resolveImages(doc)]);
-  return renderPdfWithLayout(JSON.stringify(doc), options);
+  const result = await renderPdfWithLayout(JSON.stringify(doc), options);
+  // Warnings the serializer raised (a dropped list child) ride on the
+  // document under a symbol key, which JSON.stringify leaves out.
+  const serializerWarnings = doc[SERIALIZER_WARNINGS as unknown as string] as string[] | undefined;
+  if (serializerWarnings?.length) {
+    result.warnings = [...serializerWarnings, ...result.warnings];
+  }
+  return result;
 }
 
 // ── Template rendering ──────────────────────────────────────────────

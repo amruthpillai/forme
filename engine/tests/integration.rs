@@ -15054,3 +15054,455 @@ fn docinfo_emitted_for_subject_alone() {
     );
     assert!(text.contains("/Info "), "the trailer must reference /Info");
 }
+
+// ─── #162: justified text word spacing ─────────────────────────
+
+/// A 220pt-wide justified paragraph (the #162 repro).
+fn justified_paragraph(text: Node) -> Document {
+    default_doc(vec![Node {
+        kind: NodeKind::View,
+        style: Style {
+            width: Some(Dimension::Pt(220.0)),
+            ..Default::default()
+        },
+        children: vec![text],
+        id: None,
+        source_location: None,
+        bookmark: None,
+        href: None,
+        alt: None,
+    }])
+}
+
+/// Replays the content stream's text state and returns the word spacing
+/// (`Tw`) in effect at each text-showing operator, in order. `Tw` is text
+/// state: it persists across BT/ET and only q/Q restores it.
+fn tw_at_each_show(stream: &str) -> Vec<f64> {
+    let mut stack = vec![0.0_f64];
+    let mut shown = Vec::new();
+    for line in stream.lines() {
+        let t = line.trim();
+        if t == "q" {
+            let top = *stack.last().unwrap();
+            stack.push(top);
+        } else if t == "Q" {
+            stack.pop();
+            if stack.is_empty() {
+                stack.push(0.0);
+            }
+        } else if let Some(v) = t.strip_suffix(" Tw") {
+            *stack.last_mut().unwrap() = v.trim().parse().unwrap();
+        } else if t.ends_with(" Tj") || t.ends_with(" TJ") {
+            shown.push(*stack.last().unwrap());
+        }
+    }
+    shown
+}
+
+/// #162: the last line of a justified paragraph sets no `Tw`, so it used
+/// to be drawn with the previous line's word spacing (every gap 1.56pt too
+/// wide in the repro). It must be set with natural spacing.
+#[test]
+fn test_justified_last_line_is_drawn_with_natural_word_spacing() {
+    let doc = justified_paragraph(Node {
+        kind: NodeKind::Text {
+            content: "The quick brown fox jumps over the lazy dog and keeps running across the field until the end.".to_string(),
+            href: None,
+            runs: vec![],
+        },
+        style: Style {
+            font_size: Some(11.0),
+            text_align: Some(TextAlign::Justify),
+            ..Default::default()
+        },
+        children: vec![],
+        id: None,
+        source_location: None,
+        bookmark: None,
+        href: None,
+        alt: None,
+    });
+    let stream = decompress_pdf_streams(&render_to_pdf(&doc));
+    let tw = tw_at_each_show(&stream);
+    assert!(tw.len() >= 3, "expected a multi-line paragraph, got {tw:?}");
+    assert!(
+        tw[..tw.len() - 1].iter().all(|w| *w > 0.0),
+        "precondition: the stretched lines carry word spacing, got {tw:?}"
+    );
+    assert_eq!(
+        *tw.last().unwrap(),
+        0.0,
+        "the last line must be drawn at natural word spacing, got {tw:?}"
+    );
+}
+
+/// A left-aligned paragraph after a justified one must not inherit the
+/// justified paragraph's word spacing either.
+#[test]
+fn test_text_after_a_justified_paragraph_has_no_word_spacing() {
+    let justified = Node {
+        kind: NodeKind::Text {
+            content: "The quick brown fox jumps over the lazy dog and keeps running across the field until the end.".to_string(),
+            href: None,
+            runs: vec![],
+        },
+        style: Style {
+            font_size: Some(11.0),
+            text_align: Some(TextAlign::Justify),
+            ..Default::default()
+        },
+        children: vec![],
+        id: None,
+        source_location: None,
+        bookmark: None,
+        href: None,
+        alt: None,
+    };
+    let doc = default_doc(vec![Node {
+        kind: NodeKind::View,
+        style: Style {
+            width: Some(Dimension::Pt(220.0)),
+            ..Default::default()
+        },
+        children: vec![
+            justified,
+            make_text("A plain left-aligned line after it.", 11.0),
+        ],
+        id: None,
+        source_location: None,
+        bookmark: None,
+        href: None,
+        alt: None,
+    }]);
+    let stream = decompress_pdf_streams(&render_to_pdf(&doc));
+    let tw = tw_at_each_show(&stream);
+    assert_eq!(*tw.last().unwrap(), 0.0, "got {tw:?}");
+}
+
+/// #162 (related): glyph offsets on a justified line already include the
+/// justification, and the writer added word spacing per space on top, so
+/// each style group after the first started off by it and every underline
+/// on a justified line overshot or fell short (286.17 on a line ending at
+/// 274). Every justified line but the last fills the box, so its furthest
+/// underline must end at the right edge (54 + 220).
+#[test]
+fn test_justified_multi_style_line_reaches_the_right_edge() {
+    let run = |content: &str, weight: u32| TextRun {
+        content: content.to_string(),
+        style: Style {
+            font_weight: Some(weight),
+            text_decoration: Some(TextDecoration::Underline),
+            ..Default::default()
+        },
+        href: None,
+    };
+    let doc = justified_paragraph(Node {
+        kind: NodeKind::Text {
+            content: String::new(),
+            href: None,
+            runs: vec![
+                run("The quick brown fox jumps ", 400),
+                run(
+                    "over the lazy dog and keeps running across the field until the end.",
+                    700,
+                ),
+            ],
+        },
+        style: Style {
+            font_size: Some(11.0),
+            text_align: Some(TextAlign::Justify),
+            ..Default::default()
+        },
+        children: vec![],
+        id: None,
+        source_location: None,
+        bookmark: None,
+        href: None,
+        alt: None,
+    });
+    let stream = decompress_pdf_streams(&render_to_pdf(&doc));
+    // Underlines are `x y m` / `x y l` pairs; take the first line's (the
+    // highest y) and its furthest right end.
+    let mut segs: Vec<(f64, f64)> = Vec::new(); // (y, end_x)
+    let lines: Vec<&str> = stream.lines().collect();
+    for w in lines.windows(2) {
+        if let (Some(m), Some(l)) = (w[0].strip_suffix(" m"), w[1].strip_suffix(" l")) {
+            let m: Vec<f64> = m
+                .split_whitespace()
+                .filter_map(|v| v.parse().ok())
+                .collect();
+            let l: Vec<f64> = l
+                .split_whitespace()
+                .filter_map(|v| v.parse().ok())
+                .collect();
+            if m.len() == 2 && l.len() == 2 && (m[1] - l[1]).abs() < 0.01 {
+                segs.push((l[1], l[0]));
+            }
+        }
+    }
+    let mut ys: Vec<f64> = segs.iter().map(|s| s.0).collect();
+    ys.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    ys.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+    assert!(
+        ys.len() >= 3,
+        "precondition: a multi-line paragraph, got {segs:?}"
+    );
+    let on = |y: f64| -> Vec<f64> {
+        segs.iter()
+            .filter(|s| (s.0 - y).abs() < 0.01)
+            .map(|s| s.1)
+            .collect()
+    };
+    assert!(
+        on(ys[0]).len() >= 2,
+        "precondition: two style groups on line one, got {segs:?}"
+    );
+    for y in &ys[..ys.len() - 1] {
+        let end = on(*y).into_iter().fold(f64::MIN, f64::max);
+        assert!(
+            (end - 274.0).abs() < 0.5,
+            "a justified line's underline should end at the right edge 274, ended at {end:.2} (all: {segs:?})"
+        );
+    }
+}
+
+/// Glyph offsets on a justified line already include the justification.
+/// The link-rect pass added word spacing per space on top (the #162
+/// mistake, in a second place), so on a justified line an inline link's
+/// clickable area was shifted and too wide. A paragraph that is one link
+/// gets a rect per line, and every stretched line fills the box, so its
+/// rect must end at the right edge (54 + 220) and never pass it.
+#[test]
+fn test_inline_link_rects_on_justified_lines_match_the_text() {
+    let runs = r#"{ "content": "The quick brown fox jumps over the lazy dog and keeps running across the field until the end.", "href": "https://example.com/j" }"#;
+    let style = r#", "width": { "Pt": 220 }, "textAlign": "Justify""#;
+    let bytes = forme::render_json(&inline_link_json(style, runs, None, false)).unwrap();
+    let mut links = parse_link_annotations(&bytes);
+    assert!(links.len() >= 3, "a rect per line, got {links:?}");
+    links.sort_by(|a, b| b.rect[1].partial_cmp(&a.rect[1]).unwrap());
+    for l in &links[..links.len() - 1] {
+        assert!(
+            (l.rect[2] - 274.0).abs() < 0.5,
+            "a justified line's link rect should end at 274, got {:?}",
+            l.rect
+        );
+    }
+    for l in &links {
+        assert!(l.rect[2] <= 274.0 + 0.5, "rect past the box: {:?}", l.rect);
+    }
+}
+
+/// #157 follow-up: an inline link's /Link structure element held only its
+/// annotation (OBJR); the linked words stayed in the paragraph's marked
+/// content, so a screen reader reached a link with no text in it. The
+/// words must be drawn inside /Link marked content, and the /Link element
+/// must own both that MCID and the annotation.
+#[test]
+fn test_tagged_inline_link_text_is_inside_the_link_element() {
+    let bytes = forme::render_json(&inline_link_json("", SEE_DOCS_NOW, None, true)).unwrap();
+    let stream = decompress_pdf_streams(&bytes);
+
+    // The linked word is shown inside a /Link marked-content sequence.
+    let bdc = stream
+        .find("/Link <</MCID ")
+        .expect("inline link text opens /Link marked content");
+    let mcid: u32 = stream[bdc + 14..]
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let emc = bdc
+        + stream[bdc..]
+            .find("EMC")
+            .expect("/Link marked content closes");
+    let inside = &stream[bdc..emc];
+    assert!(
+        inside.contains("(docs) Tj"),
+        "the link text is inside /Link: {inside}"
+    );
+    assert!(
+        !inside.contains("See") && !inside.contains("now"),
+        "only the link text is inside /Link: {inside}"
+    );
+
+    // The /Link structure element owns that MCID and the annotation.
+    let text = String::from_utf8_lossy(&bytes);
+    let link = text
+        .split("/S /Link")
+        .nth(1)
+        .expect("a /Link structure element");
+    let link = &link[..link.find("endobj").unwrap()];
+    assert!(
+        link.contains(&format!("/MCID {mcid}")),
+        "/Link lists its text's MCID {mcid}: {link}"
+    );
+    assert!(link.contains("/OBJR"), "/Link lists its annotation: {link}");
+}
+
+/// A tagged inline link that wraps onto a second line is two /Link
+/// elements (one annotation per line), each owning its words and its
+/// annotation, and closing a line inside a link leaves marked content and
+/// text objects balanced.
+#[test]
+fn test_tagged_inline_link_wrapping_lines_stays_balanced() {
+    let runs = r#"
+        { "content": "See the " },
+        { "content": "sit amet consectetur adipiscing", "href": "https://example.com/wrap" },
+        { "content": " elit." }"#;
+    let style = r#", "width": { "Pt": 110 }"#;
+    let bytes = forme::render_json(&inline_link_json(style, runs, None, true)).unwrap();
+    let stream = decompress_pdf_streams(&bytes);
+    let count = |pat: &str| stream.lines().filter(|l| l.trim() == pat).count();
+    let opens = stream
+        .lines()
+        .filter(|l| l.ends_with(" BDC") || l.ends_with(" BMC"))
+        .count();
+    assert_eq!(opens, count("EMC"), "marked content balanced:\n{stream}");
+    assert_eq!(count("BT"), count("ET"), "text objects balanced:\n{stream}");
+
+    let text = String::from_utf8_lossy(&bytes);
+    let links: Vec<&str> = text
+        .split("/S /Link")
+        .skip(1)
+        .map(|c| &c[..c.find("endobj").unwrap()])
+        .collect();
+    assert!(links.len() >= 2, "one /Link per line: {links:?}");
+    for l in &links {
+        assert!(
+            l.contains("/MCID") && l.contains("/OBJR"),
+            "text and annotation: {l}"
+        );
+    }
+    assert_eq!(
+        stream.matches("/Link <</MCID ").count(),
+        links.len(),
+        "each /Link element has one marked-content sequence"
+    );
+}
+
+// ─── #156 follow-up: right-to-left text drawn in visual order ─────────
+
+/// Lay out one text line in Liberation Sans (in the repo, and covers
+/// Hebrew, so this runs on CI too) and read its glyphs left to right.
+fn visual_order(content: &str, direction: Direction) -> String {
+    let font = std::fs::read("../packages/fonts-standard/fonts/LiberationSans-Regular.ttf")
+        .expect("Liberation Sans in the repo");
+    let mut font_context = FontContext::new();
+    font_context
+        .registry_mut()
+        .register("Liberation", 400, false, font);
+    let mut text = make_text(content, 16.0);
+    text.style.font_family = Some("Liberation".to_string());
+    text.style.direction = Some(direction);
+    let doc = default_doc(vec![text]);
+    let pages = LayoutEngine::new().layout(&doc, &font_context);
+    fn glyphs(els: &[forme::layout::LayoutElement], out: &mut Vec<(f64, char)>) {
+        for el in els {
+            if let forme::layout::DrawCommand::Text { lines, .. } = &el.draw {
+                for line in lines {
+                    for g in &line.glyphs {
+                        out.push((line.x + g.x_offset, g.char_value));
+                    }
+                }
+            }
+            glyphs(&el.children, out);
+        }
+    }
+    let mut out = Vec::new();
+    glyphs(&pages[0].elements, &mut out);
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    out.into_iter().map(|(_, c)| c).collect()
+}
+
+/// Shaping already returns an RTL run's glyphs in visual order, and BiDi
+/// reordering then reversed them again, so Hebrew was drawn in logical
+/// order left to right: it read backwards on the page and extracted
+/// reversed ("שלום עולם" came out "םלוע םולש"). Read left to right, an RTL
+/// run's glyphs are its logical text reversed.
+#[test]
+fn test_rtl_text_is_drawn_in_visual_order() {
+    for dir in [Direction::Rtl, Direction::Auto, Direction::Ltr] {
+        assert_eq!(
+            visual_order("שלום עולם", dir),
+            "םלוע םולש",
+            "a Hebrew line ({dir:?} paragraph) reads right to left"
+        );
+    }
+}
+
+/// In a left-to-right paragraph an embedded Hebrew phrase is reversed in
+/// place and the Latin around it keeps its order.
+#[test]
+fn test_rtl_phrase_inside_ltr_text_is_reversed_in_place() {
+    assert_eq!(
+        visual_order("Total: שלום עולם today", Direction::Ltr),
+        "Total: םלוע םולש today"
+    );
+}
+
+/// An RTL paragraph with embedded numbers and Latin: the LTR pieces keep
+/// their own order inside the reversed line. Expected order read off
+/// Chrome's glyph positions for the same line.
+#[test]
+fn test_rtl_paragraph_with_embedded_ltr_matches_chrome_order() {
+    assert_eq!(
+        visual_order("המחיר הוא 120 שקלים עבור ABC בלבד", Direction::Rtl),
+        "דבלב ABC רובע םילקש 120 אוה ריחמה"
+    );
+}
+
+// ─── #157 follow-up: a link nested inside a link ─────────────────────
+
+fn linked_view_with_text_runs(outer: &str, inner: &str) -> Document {
+    let doc_json = format!(
+        r#"{{
+        "children": [{{
+            "kind": {{ "type": "View" }}, "href": "{outer}", "style": {{}},
+            "children": [{{
+                "kind": {{ "type": "Text", "content": "", "runs": [
+                    {{ "content": "Read the " }},
+                    {{ "content": "docs", "href": "{inner}" }},
+                    {{ "content": " here." }}
+                ] }},
+                "style": {{}}, "children": []
+            }}]
+        }}],
+        "metadata": {{}}
+    }}"#
+    );
+    serde_json::from_str(&doc_json).expect("document JSON")
+}
+
+/// HTML forbids a link inside a link. Forme keeps the outer link: its
+/// annotation covers the whole box, and the inner one is dropped, which
+/// used to happen silently. It now says so.
+#[test]
+fn test_a_link_nested_inside_a_different_link_warns() {
+    let doc = linked_view_with_text_runs("https://example.com/card", "https://example.com/docs");
+    let (pdf, warnings) = forme::render_with_warnings(&doc).expect("render");
+    let links = parse_link_annotations(&pdf);
+    assert_eq!(
+        links.len(),
+        1,
+        "only the outer link is clickable: {links:?}"
+    );
+    assert_eq!(links[0].uri.as_deref(), Some("https://example.com/card"));
+    assert!(
+        warnings.iter().any(|w| w.starts_with("render defect:")
+            && w.contains("https://example.com/docs")
+            && w.contains("https://example.com/card")),
+        "the dropped inner link is reported, got {warnings:?}"
+    );
+}
+
+/// The same href inside itself loses nothing, so it is not reported.
+#[test]
+fn test_a_link_nested_inside_the_same_link_does_not_warn() {
+    let doc = linked_view_with_text_runs("https://example.com/card", "https://example.com/card");
+    let (_, warnings) = forme::render_with_warnings(&doc).expect("render");
+    assert!(
+        !warnings.iter().any(|w| w.contains("nested")),
+        "no loss, no warning: {warnings:?}"
+    );
+}

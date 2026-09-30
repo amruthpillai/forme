@@ -483,6 +483,7 @@ impl PdfWriter {
             // Collect link annotations (deferred creation until pass 2)
             let mut annotations: Vec<LinkAnnotation> = Vec::new();
             Self::collect_link_annotations(&page.elements, page.height, &mut annotations);
+            Self::warn_nested_links(&page.elements, None, &mut builder.warnings);
             per_page_annotations.push(annotations);
 
             // Collect form field annotations
@@ -1594,6 +1595,11 @@ impl PdfWriter {
         // own ink (borders, row backgrounds) must be marked /Artifact and
         // only its children carry tagged content.
         let mut artifact_own_draw = false;
+        // Inline /Link elements created for this element's text, in drawing
+        // order, and the role its marked content opened with: the text writer
+        // closes that content around each link's words and reopens it after.
+        let mut inline_links: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        let mut bdc_role: Option<&'static str> = None;
         let tagged_mcid = if let Some(ref mut tb) = tag_builder {
             if let Some(ref nt) = element.node_type {
                 if nt == "Watermark" {
@@ -1631,7 +1637,8 @@ impl PdfWriter {
                         if let DrawCommand::Text { ref lines, .. } = element.draw {
                             for line in lines {
                                 for span in Self::inline_link_spans(line) {
-                                    tb.add_inline_link(page_idx, &span.href);
+                                    inline_links
+                                        .push_back(tb.add_inline_link(page_idx, &span.href));
                                 }
                             }
                         }
@@ -1646,6 +1653,7 @@ impl PdfWriter {
                                 tb.map_role_public(nt, is_header)
                             };
                             let _ = writeln!(stream, "/{} <</MCID {}>> BDC", role, mcid);
+                            bdc_role = Some(role);
                             Some(mcid)
                         }
                         None => {
@@ -1912,6 +1920,19 @@ impl PdfWriter {
                     }
                 }
 
+                // `Tw` is text state: it survives ET and only Q restores it.
+                // A line that sets none (a justified paragraph's last line)
+                // was drawn with the previous line's spacing (#162), so once
+                // a line sets it, the next line without it resets to 0.
+                // Text that never sets it emits nothing, as before.
+                let mut tw_set = false;
+                // Tagged text with inline links: each link's words are drawn
+                // inside its own /Link marked content (#157). Groups then also
+                // split where a link starts or ends, and at each boundary the
+                // text object and the marked content are closed and reopened
+                // (marked content may not cross BT/ET). Everything else takes
+                // the untouched path below.
+                let tag_links = bdc_role.is_some() && !inline_links.is_empty();
                 for line in lines {
                     if line.glyphs.is_empty() {
                         continue;
@@ -1919,7 +1940,13 @@ impl PdfWriter {
 
                     // Group consecutive glyphs by (font_family, font_weight, font_style, font_size, color)
                     // to support multi-font text runs
-                    let groups = Self::group_glyphs_by_style(&line.glyphs);
+                    let groups = Self::group_glyphs(&line.glyphs, tag_links);
+                    let group_links = if tag_links {
+                        Self::group_link_runs(&groups)
+                    } else {
+                        vec![None; groups.len()]
+                    };
+                    let mut open_link: Option<&str> = None;
                     let pdf_y = page_height - line.y;
 
                     let _ = writeln!(stream, "BT");
@@ -1927,6 +1954,10 @@ impl PdfWriter {
                     // Set word spacing for justification (PDF Tw operator)
                     if line.word_spacing.abs() > 0.001 {
                         let _ = writeln!(stream, "{:.4} Tw", line.word_spacing);
+                        tw_set = true;
+                    } else if tw_set {
+                        let _ = writeln!(stream, "0 Tw");
+                        tw_set = false;
                     }
 
                     // Track current text matrix position for relative Td moves
@@ -1937,7 +1968,30 @@ impl PdfWriter {
                     // Track group spans for per-group text decoration
                     let mut group_spans: Vec<(f64, f64, TextDecoration, Color)> = Vec::new();
 
-                    for group in &groups {
+                    for (gi, group) in groups.iter().enumerate() {
+                        let want = group_links[gi];
+                        if want != open_link {
+                            let _ = writeln!(stream, "ET\nEMC");
+                            let role = bdc_role.unwrap_or("Span");
+                            let tb = tag_builder.as_mut().expect("tag_links implies tagging");
+                            let link = want.and_then(|_| inline_links.pop_front());
+                            match link {
+                                Some(idx) => {
+                                    let mcid = tb.attach_inline_link(idx, page_idx);
+                                    let _ = writeln!(stream, "/Link <</MCID {}>> BDC", mcid);
+                                    open_link = want;
+                                }
+                                None => {
+                                    let mcid = tb.continue_current(page_idx);
+                                    let _ = writeln!(stream, "/{} <</MCID {}>> BDC", role, mcid);
+                                    open_link = None;
+                                }
+                            }
+                            // A new text object starts at the identity matrix.
+                            let _ = writeln!(stream, "BT");
+                            tm_x = 0.0;
+                            tm_y = 0.0;
+                        }
                         let first = &group[0];
                         let glyph_color = first.color.unwrap_or(*color);
 
@@ -2046,15 +2100,14 @@ impl PdfWriter {
                         // Record span for per-group text decoration
                         let group_start_x = x_cursor;
 
-                        // Advance x_cursor past this group using shaped advances
-                        // Account for word_spacing on spaces (Tw adds to each space char)
+                        // Advance x_cursor past this group. Glyph offsets already
+                        // include the justification: Tw only makes the drawn
+                        // text match them. Adding word_spacing per space here
+                        // again counted it twice, so the next group and every
+                        // underline were off by it (286pt on a line ending at
+                        // 274, #162).
                         if let Some(last) = group.last() {
-                            let space_count_in_group =
-                                group.iter().filter(|g| g.char_value == ' ').count();
-                            x_cursor = line.x
-                                + last.x_offset
-                                + last.x_advance
-                                + space_count_in_group as f64 * line.word_spacing;
+                            x_cursor = line.x + last.x_offset + last.x_advance;
                         }
 
                         // Check if this group has text decoration
@@ -2065,6 +2118,19 @@ impl PdfWriter {
                     }
 
                     let _ = writeln!(stream, "ET");
+                    // A line that ends inside a link hands the rest of the
+                    // element (its decorations, the next line) back to the
+                    // element's own marked content.
+                    if open_link.is_some() {
+                        let tb = tag_builder.as_mut().expect("tag_links implies tagging");
+                        let mcid = tb.continue_current(page_idx);
+                        let _ = writeln!(
+                            stream,
+                            "EMC\n/{} <</MCID {}>> BDC",
+                            bdc_role.unwrap_or("Span"),
+                            mcid
+                        );
+                    }
 
                     // Draw per-group text decorations
                     for (span_x, span_end_x, dec, dec_color) in &group_spans {
@@ -2119,6 +2185,21 @@ impl PdfWriter {
                                 line.x + line.width, strikethrough_y
                             );
                         }
+                    }
+                }
+
+                // A paragraph whose last line here is stretched (it goes on
+                // to the next page) must not hand its spacing to whatever
+                // text is drawn next on this page.
+                if tw_set {
+                    let _ = writeln!(stream, "0 Tw");
+                }
+                // Every created /Link must be in the tree: its annotation
+                // points at it. One whose words were never drawn is placed
+                // without content.
+                if let Some(tb) = tag_builder.as_mut() {
+                    while let Some(idx) = inline_links.pop_front() {
+                        tb.attach_inline_link_without_content(idx);
                     }
                 }
 
@@ -4244,6 +4325,12 @@ impl PdfWriter {
     /// Group consecutive glyphs by (font_family, font_weight, font_style, font_size, color)
     /// for multi-font text run rendering.
     fn group_glyphs_by_style(glyphs: &[PositionedGlyph]) -> Vec<Vec<&PositionedGlyph>> {
+        Self::group_glyphs(glyphs, false)
+    }
+
+    /// Group consecutive glyphs by style; with `split_on_href`, also where
+    /// the per-glyph href changes, so a link's words form their own groups.
+    fn group_glyphs(glyphs: &[PositionedGlyph], split_on_href: bool) -> Vec<Vec<&PositionedGlyph>> {
         if glyphs.is_empty() {
             return vec![];
         }
@@ -4260,7 +4347,8 @@ impl PdfWriter {
                 && (glyph.font_size - prev.font_size).abs() < 0.01
                 && Self::colors_equal(&glyph.color, &prev.color)
                 && std::mem::discriminant(&glyph.text_decoration)
-                    == std::mem::discriminant(&prev.text_decoration);
+                    == std::mem::discriminant(&prev.text_decoration)
+                && (!split_on_href || glyph.href == prev.href);
 
             if same_style {
                 current_group.push(glyph);
@@ -4271,6 +4359,35 @@ impl PdfWriter {
         }
         groups.push(current_group);
         groups
+    }
+
+    /// For each group, the href of the inline link it is drawn in, or `None`.
+    /// A link is a maximal run of groups with the same non-empty href; a run
+    /// of nothing but whitespace is not one, matching `inline_link_spans`,
+    /// which drops it (no ink, so no annotation and no /Link element).
+    fn group_link_runs<'a>(groups: &[Vec<&'a PositionedGlyph>]) -> Vec<Option<&'a str>> {
+        let hrefs: Vec<Option<&'a str>> = groups
+            .iter()
+            .map(|g| g[0].href.as_deref().filter(|h| !h.is_empty()))
+            .collect();
+        let mut out = vec![None; groups.len()];
+        let mut i = 0;
+        while i < groups.len() {
+            let mut j = i + 1;
+            while j < groups.len() && hrefs[j] == hrefs[i] {
+                j += 1;
+            }
+            let inked = groups[i..j]
+                .iter()
+                .any(|g| g.iter().any(|gl| !gl.char_value.is_whitespace()));
+            if hrefs[i].is_some() && inked {
+                for slot in &mut out[i..j] {
+                    *slot = hrefs[i];
+                }
+            }
+            i = j;
+        }
+        out
     }
 
     fn colors_equal(a: &Option<Color>, b: &Option<Color>) -> bool {
@@ -4289,6 +4406,47 @@ impl PdfWriter {
     /// Collect link annotations from layout elements recursively.
     /// When an element has an href, its rect covers all children, so we skip
     /// recursing into children to avoid duplicate annotations.
+    /// Report links nested inside a different link. The outer link's
+    /// annotation covers its whole box and `collect_link_annotations` does
+    /// not look inside it, so an inner link (an element href or an inline
+    /// run's) is dropped. HTML forbids nesting links, so the outer one
+    /// winning is the defined behaviour; it used to be silent.
+    fn warn_nested_links(
+        elements: &[LayoutElement],
+        outer: Option<&str>,
+        warnings: &mut Vec<String>,
+    ) {
+        fn report(warnings: &mut Vec<String>, inner: &str, outer: &str) {
+            let msg = format!(
+                "render defect: a link to \"{inner}\" is inside a link to \"{outer}\". Links cannot be nested (HTML forbids it), so the outer link covers the whole area and the inner one was dropped"
+            );
+            if !warnings.contains(&msg) {
+                warnings.push(msg);
+            }
+        }
+        for el in elements {
+            let own = el.href.as_deref().filter(|h| !h.is_empty());
+            if let (Some(o), Some(h)) = (outer, own) {
+                if h != o {
+                    report(warnings, h, o);
+                }
+            }
+            let enclosing = outer.or(own);
+            if let Some(o) = enclosing {
+                if let DrawCommand::Text { ref lines, .. } = el.draw {
+                    for g in lines.iter().flat_map(|l| l.glyphs.iter()) {
+                        if let Some(h) = g.href.as_deref().filter(|h| !h.is_empty()) {
+                            if h != o {
+                                report(warnings, h, o);
+                            }
+                        }
+                    }
+                }
+            }
+            Self::warn_nested_links(&el.children, enclosing, warnings);
+        }
+    }
+
     fn collect_link_annotations(
         elements: &[LayoutElement],
         page_height: f64,
@@ -4344,51 +4502,40 @@ impl PdfWriter {
     }
 
     /// Contiguous runs of glyphs on one line that share a per-glyph href,
-    /// with the x extent they are actually drawn at. Positions mirror the
-    /// text writer (style groups placed at `x_cursor`, `Tw` added per space)
-    /// so the annotation lands on the ink, justified lines included.
+    /// with the x extent they are drawn at. A glyph's offset already
+    /// includes justification and `wordSpacing` (Tw only makes the drawn
+    /// text match it), so it is used as is. Adding Tw per space again here
+    /// put a justified line's link rect up to 6pt past its text (#162's
+    /// mistake, in a second place).
     fn inline_link_spans(line: &TextLine) -> Vec<InlineLinkSpan> {
         let mut spans: Vec<InlineLinkSpan> = Vec::new();
         if !line.glyphs.iter().any(|g| g.href.is_some()) {
             return spans;
         }
-        let mut x_cursor = line.x;
         let mut prev_href: Option<&str> = None;
-        for group in Self::group_glyphs_by_style(&line.glyphs) {
-            let first = group[0];
-            let mut spaces = 0usize;
-            for g in &group {
-                let x0 =
-                    x_cursor + (g.x_offset - first.x_offset) + spaces as f64 * line.word_spacing;
-                let x1 = x0 + g.x_advance;
-                if g.char_value == ' ' {
-                    spaces += 1;
+        for g in &line.glyphs {
+            let x0 = line.x + g.x_offset;
+            let x1 = x0 + g.x_advance;
+            let href = g.href.as_deref().filter(|h| !h.is_empty());
+            if let Some(h) = href {
+                if prev_href != Some(h) {
+                    spans.push(InlineLinkSpan {
+                        href: h.to_string(),
+                        x0: f64::INFINITY,
+                        x1: f64::NEG_INFINITY,
+                    });
                 }
-                let href = g.href.as_deref().filter(|h| !h.is_empty());
-                if let Some(h) = href {
-                    if prev_href != Some(h) {
-                        spans.push(InlineLinkSpan {
-                            href: h.to_string(),
-                            x0: f64::INFINITY,
-                            x1: f64::NEG_INFINITY,
-                        });
-                    }
-                    // Only ink extends the rect: a space at a span's edge
-                    // (the one a wrapped line ends on, or "docs " in the
-                    // source) would widen the target past the text.
-                    if !g.char_value.is_whitespace() {
-                        if let Some(last) = spans.last_mut() {
-                            last.x0 = last.x0.min(x0);
-                            last.x1 = last.x1.max(x1);
-                        }
+                // Only ink extends the rect: a space at a span's edge
+                // (the one a wrapped line ends on, or "docs " in the
+                // source) would widen the target past the text.
+                if !g.char_value.is_whitespace() {
+                    if let Some(last) = spans.last_mut() {
+                        last.x0 = last.x0.min(x0);
+                        last.x1 = last.x1.max(x1);
                     }
                 }
-                prev_href = href;
             }
-            if let Some(last) = group.last() {
-                x_cursor =
-                    line.x + last.x_offset + last.x_advance + spaces as f64 * line.word_spacing;
-            }
+            prev_href = href;
         }
         // A span of nothing but spaces has no ink to link.
         spans.retain(|s| s.x1 > s.x0);
@@ -4946,6 +5093,55 @@ fn write_chart_primitive(
             // Undo Y-flip for text rendering, then position
             let _ = writeln!(stream, "q");
             let _ = writeln!(stream, "1 0 0 -1 {:.4} {:.4} cm", x + x_offset, *y);
+            let _ = writeln!(
+                stream,
+                "BT /F{} {:.1} Tf {:.3} {:.3} {:.3} rg 0 0 Td ({}) Tj ET",
+                font_idx, font_size, color.r, color.g, color.b, escaped
+            );
+            let _ = writeln!(stream, "Q");
+        }
+        ChartPrimitive::VerticalLabel {
+            text,
+            x,
+            y,
+            font_size,
+            color,
+        } => {
+            let metrics = crate::font::StandardFont::Helvetica.metrics();
+            let text_width = metrics.measure_string(text, *font_size, 0.0);
+            let font_idx = builder
+                .font_objects
+                .iter()
+                .enumerate()
+                .find(|(_, (key, _))| key.family == "Helvetica" && key.weight == 400 && !key.italic)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let encoded: String = text
+                .chars()
+                .map(|ch| {
+                    if let Some(code) = unicode_to_winansi(ch) {
+                        code as char
+                    } else if (ch as u32) >= 32 && (ch as u32) <= 255 {
+                        ch
+                    } else {
+                        builder.missing_glyphs.borrow_mut().insert(ch);
+                        '?'
+                    }
+                })
+                .collect();
+            let escaped = pdf_escape_string(&encoded);
+
+            // Chart space is y-down. Text runs up the page, so its baseline
+            // points to -y here and its glyphs' up points to -x: `0 -1 -1 0`.
+            // Start half the text's length below the centre, with the
+            // baseline 0.35em right of it so the glyphs sit centred on x.
+            let _ = writeln!(stream, "q");
+            let _ = writeln!(
+                stream,
+                "0 -1 -1 0 {:.4} {:.4} cm",
+                x + font_size * 0.35,
+                y + text_width / 2.0
+            );
             let _ = writeln!(
                 stream,
                 "BT /F{} {:.1} Tf {:.3} {:.3} {:.3} rg 0 0 Td ({}) Tj ET",

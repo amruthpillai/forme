@@ -127,7 +127,31 @@ export type _DocumentClaimParity = AssertTrue<
   Exact<Pick<DocumentProps, keyof FormeDocumentClaimProps>, FormeDocumentClaimProps>
 >;
 
+/**
+ * Warnings the serializer raises (a dropped list child) collected during a
+ * call and attached to the document under this symbol, where
+ * `@formepdf/core` picks them up into the render's `warnings`. A symbol
+ * key never reaches `JSON.stringify`, so the engine input is unchanged.
+ */
+export const SERIALIZER_WARNINGS = Symbol.for('formepdf.serializerWarnings');
+let collectedWarnings: string[] | null = null;
+
 export function parseMarkup(markup: string): FormeDocument {
+  const outer = collectedWarnings;
+  const warnings: string[] = [];
+  collectedWarnings = warnings;
+  try {
+    const doc = parseMarkupDocument(markup);
+    if (warnings.length > 0) {
+      (doc as unknown as Record<symbol, unknown>)[SERIALIZER_WARNINGS] = warnings;
+    }
+    return doc;
+  } finally {
+    collectedWarnings = outer;
+  }
+}
+
+function parseMarkupDocument(markup: string): FormeDocument {
   const fragment = parseFragment(markup);
   const root = findDocumentRoot(fragment.childNodes);
 
@@ -646,10 +670,12 @@ function componentNameOf(tagName: string): string {
 }
 
 function warnDroppedListChild(listName: string, what: string): void {
-  console.warn(
+  const message =
     `[Forme] <${listName}> dropped ${what}: only <ListItem> children are rendered in a list. `
-    + `Wrap the content in <ListItem>.`,
-  );
+    + `Wrap the content in <ListItem>.`;
+  // The console still gets it: renderDocument returns bytes only.
+  console.warn(message);
+  collectedWarnings?.push(message);
 }
 
 function parseListItem(element: P5Element): FormeNode {
