@@ -4953,6 +4953,55 @@ fn write_chart_primitive(
             );
             let _ = writeln!(stream, "Q");
         }
+        ChartPrimitive::VerticalLabel {
+            text,
+            x,
+            y,
+            font_size,
+            color,
+        } => {
+            let metrics = crate::font::StandardFont::Helvetica.metrics();
+            let text_width = metrics.measure_string(text, *font_size, 0.0);
+            let font_idx = builder
+                .font_objects
+                .iter()
+                .enumerate()
+                .find(|(_, (key, _))| key.family == "Helvetica" && key.weight == 400 && !key.italic)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let encoded: String = text
+                .chars()
+                .map(|ch| {
+                    if let Some(code) = unicode_to_winansi(ch) {
+                        code as char
+                    } else if (ch as u32) >= 32 && (ch as u32) <= 255 {
+                        ch
+                    } else {
+                        builder.missing_glyphs.borrow_mut().insert(ch);
+                        '?'
+                    }
+                })
+                .collect();
+            let escaped = pdf_escape_string(&encoded);
+
+            // Chart space is y-down. Text runs up the page, so its baseline
+            // points to -y here and its glyphs' up points to -x: `0 -1 -1 0`.
+            // Start half the text's length below the centre, with the
+            // baseline 0.35em right of it so the glyphs sit centred on x.
+            let _ = writeln!(stream, "q");
+            let _ = writeln!(
+                stream,
+                "0 -1 -1 0 {:.4} {:.4} cm",
+                x + font_size * 0.35,
+                y + text_width / 2.0
+            );
+            let _ = writeln!(
+                stream,
+                "BT /F{} {:.1} Tf {:.3} {:.3} {:.3} rg 0 0 Td ({}) Tj ET",
+                font_idx, font_size, color.r, color.g, color.b, escaped
+            );
+            let _ = writeln!(stream, "Q");
+        }
     }
 }
 
