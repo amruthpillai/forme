@@ -209,7 +209,32 @@ function oneNode<T>(nodes: T[]): T | Record<string, unknown> | null {
  * Serialize a React element tree into a Forme JSON document object.
  * The top-level element must be a <Document> (or a component that returns one).
  */
+/**
+ * Warnings the serializer raises (a dropped list child) collected during a
+ * `serialize()` call and attached to the document under this symbol, where
+ * `@formepdf/core` picks them up into the render's `warnings`. A symbol
+ * key never reaches `JSON.stringify`, so the engine input is unchanged.
+ * `Symbol.for`, so core reads it without importing this package.
+ */
+export const SERIALIZER_WARNINGS = Symbol.for('formepdf.serializerWarnings');
+let collectedWarnings: string[] | null = null;
+
 export function serialize(element: ReactElement): FormeDocument {
+  const outer = collectedWarnings;
+  const warnings: string[] = [];
+  collectedWarnings = warnings;
+  try {
+    const doc = serializeDocument(element);
+    if (warnings.length > 0) {
+      (doc as unknown as Record<symbol, unknown>)[SERIALIZER_WARNINGS] = warnings;
+    }
+    return doc;
+  } finally {
+    collectedWarnings = outer;
+  }
+}
+
+function serializeDocument(element: ReactElement): FormeDocument {
   element = resolveElement(element);
 
   if (!isDocumentType(element.type)) {
@@ -825,15 +850,17 @@ function describeChild(c: unknown): string {
 }
 
 /**
- * The serializer has no warnings channel of its own (render `warnings` come
- * from the engine, which never sees what was dropped here), so a dropped
- * list child is reported the way the deprecated `signature` prop is.
+ * Report a dropped list child on the console and to the active
+ * `serialize()` call, which hands it to the render's `warnings` (see
+ * SERIALIZER_WARNINGS).
  */
 function warnDroppedListChild(listName: string, what: string): void {
-  console.warn(
+  const message =
     `[Forme] <${listName}> dropped ${what}: only <ListItem> children are rendered in a list. `
-    + `Wrap the content in <ListItem>.`,
-  );
+    + `Wrap the content in <ListItem>.`;
+  // The console still gets it: renderDocument returns bytes only.
+  console.warn(message);
+  collectedWarnings?.push(message);
 }
 
 function serializeHeading(element: ReactElement, level: 1 | 2 | 3 | 4 | 5 | 6): FormeNode {

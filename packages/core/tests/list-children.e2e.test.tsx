@@ -6,11 +6,12 @@
  * The serializer-level tests in packages/react pin the JSON shapes; these pin
  * what the engine then paints from them.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   Document,
   Page,
   Text,
+  View,
   UnorderedList,
   ListItem,
   serializeTemplate,
@@ -56,5 +57,26 @@ describe('#161 .map() inside a list (template vs direct)', () => {
     const directLines = textLines(direct.layout.pages);
     expect(directLines.filter((l) => l === 'one' || l === 'two')).toEqual(['one', 'two']);
     expect(textLines(template.layout.pages)).toEqual(directLines);
+  });
+});
+
+describe('#161 a dropped list child reaches the render warnings', () => {
+  it('renderDocumentWithLayout returns it in warnings, not only on the console', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { warnings } = await renderDocumentWithLayout(
+        <Document>
+          <Page>
+            <UnorderedList>
+              <ListItem><Text>kept</Text></ListItem>
+              <View><Text>stray</Text></View>
+            </UnorderedList>
+          </Page>
+        </Document>,
+      );
+      expect(warnings.some((w) => /UnorderedList.*View/.test(w))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
