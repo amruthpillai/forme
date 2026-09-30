@@ -15291,3 +15291,92 @@ fn test_inline_link_rects_on_justified_lines_match_the_text() {
         assert!(l.rect[2] <= 274.0 + 0.5, "rect past the box: {:?}", l.rect);
     }
 }
+
+/// #157 follow-up: an inline link's /Link structure element held only its
+/// annotation (OBJR); the linked words stayed in the paragraph's marked
+/// content, so a screen reader reached a link with no text in it. The
+/// words must be drawn inside /Link marked content, and the /Link element
+/// must own both that MCID and the annotation.
+#[test]
+fn test_tagged_inline_link_text_is_inside_the_link_element() {
+    let bytes = forme::render_json(&inline_link_json("", SEE_DOCS_NOW, None, true)).unwrap();
+    let stream = decompress_pdf_streams(&bytes);
+
+    // The linked word is shown inside a /Link marked-content sequence.
+    let bdc = stream
+        .find("/Link <</MCID ")
+        .expect("inline link text opens /Link marked content");
+    let mcid: u32 = stream[bdc + 14..]
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let emc = bdc
+        + stream[bdc..]
+            .find("EMC")
+            .expect("/Link marked content closes");
+    let inside = &stream[bdc..emc];
+    assert!(
+        inside.contains("(docs) Tj"),
+        "the link text is inside /Link: {inside}"
+    );
+    assert!(
+        !inside.contains("See") && !inside.contains("now"),
+        "only the link text is inside /Link: {inside}"
+    );
+
+    // The /Link structure element owns that MCID and the annotation.
+    let text = String::from_utf8_lossy(&bytes);
+    let link = text
+        .split("/S /Link")
+        .nth(1)
+        .expect("a /Link structure element");
+    let link = &link[..link.find("endobj").unwrap()];
+    assert!(
+        link.contains(&format!("/MCID {mcid}")),
+        "/Link lists its text's MCID {mcid}: {link}"
+    );
+    assert!(link.contains("/OBJR"), "/Link lists its annotation: {link}");
+}
+
+/// A tagged inline link that wraps onto a second line is two /Link
+/// elements (one annotation per line), each owning its words and its
+/// annotation, and closing a line inside a link leaves marked content and
+/// text objects balanced.
+#[test]
+fn test_tagged_inline_link_wrapping_lines_stays_balanced() {
+    let runs = r#"
+        { "content": "See the " },
+        { "content": "sit amet consectetur adipiscing", "href": "https://example.com/wrap" },
+        { "content": " elit." }"#;
+    let style = r#", "width": { "Pt": 110 }"#;
+    let bytes = forme::render_json(&inline_link_json(style, runs, None, true)).unwrap();
+    let stream = decompress_pdf_streams(&bytes);
+    let count = |pat: &str| stream.lines().filter(|l| l.trim() == pat).count();
+    let opens = stream
+        .lines()
+        .filter(|l| l.ends_with(" BDC") || l.ends_with(" BMC"))
+        .count();
+    assert_eq!(opens, count("EMC"), "marked content balanced:\n{stream}");
+    assert_eq!(count("BT"), count("ET"), "text objects balanced:\n{stream}");
+
+    let text = String::from_utf8_lossy(&bytes);
+    let links: Vec<&str> = text
+        .split("/S /Link")
+        .skip(1)
+        .map(|c| &c[..c.find("endobj").unwrap()])
+        .collect();
+    assert!(links.len() >= 2, "one /Link per line: {links:?}");
+    for l in &links {
+        assert!(
+            l.contains("/MCID") && l.contains("/OBJR"),
+            "text and annotation: {l}"
+        );
+    }
+    assert_eq!(
+        stream.matches("/Link <</MCID ").count(),
+        links.len(),
+        "each /Link element has one marked-content sequence"
+    );
+}

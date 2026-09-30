@@ -324,13 +324,13 @@ impl TagBuilder {
             .any(|&idx| self.elements[idx].role == "Link")
     }
 
-    /// Add a /Link structure element for an inline link (a linked run inside
-    /// a paragraph) as a child of the currently open element, and record a
-    /// link slot so the annotation pass attaches the annotation to it (OBJR +
-    /// /StructParent, PDF/UA 7.18.5-1). The link's text stays in the line's
-    /// own marked content: moving it inside the /Link would mean splitting
-    /// the line's marked-content sequence per run.
-    pub fn add_inline_link(&mut self, page_idx: usize, href: &str) {
+    /// Create a /Link structure element for an inline link (a linked run
+    /// inside a paragraph) and record a link slot so the annotation pass
+    /// attaches the annotation to it (OBJR + /StructParent, PDF/UA 7.18.5-1).
+    /// It is not yet placed in the tree: the text writer attaches it with
+    /// [`Self::attach_inline_link`] where its words are drawn, so the
+    /// parent's children stay in reading order around it. Returns its index.
+    pub fn add_inline_link(&mut self, page_idx: usize, href: &str) -> usize {
         let parent_idx = *self.parent_stack.last().unwrap_or(&0);
         let elem_idx = self.elements.len();
         self.elements.push(StructElement {
@@ -342,15 +342,58 @@ impl TagBuilder {
             list_numbering: None,
             actual_text: None,
         });
-        self.elements[parent_idx]
-            .kids
-            .push(StructKid::StructRef(elem_idx));
         self.link_slots.push(LinkSlot {
             page_idx,
             elem_idx,
             href: href.to_string(),
             matched: false,
         });
+        elem_idx
+    }
+
+    /// Place an inline /Link in its parent's children at this point in the
+    /// reading order and give it a marked-content id for its words, which
+    /// the caller draws inside `/Link <</MCID n>> BDC ... EMC`. The words used
+    /// to stay in the line's own marked content, leaving a screen reader a
+    /// link with no text (#157).
+    pub fn attach_inline_link(&mut self, elem_idx: usize, page_idx: usize) -> u32 {
+        let parent_idx = self.elements[elem_idx].parent_idx;
+        self.elements[parent_idx]
+            .kids
+            .push(StructKid::StructRef(elem_idx));
+        let mcid = self.next_mcid(page_idx);
+        self.elements[elem_idx]
+            .kids
+            .push(StructKid::MarkedContent { page_idx, mcid });
+        self.mcid_to_struct.push((page_idx, mcid, elem_idx));
+        mcid
+    }
+
+    /// Place an inline /Link whose words were never drawn (a guard: every
+    /// created link must be in the tree, since its annotation points at it).
+    pub fn attach_inline_link_without_content(&mut self, elem_idx: usize) {
+        let parent_idx = self.elements[elem_idx].parent_idx;
+        self.elements[parent_idx]
+            .kids
+            .push(StructKid::StructRef(elem_idx));
+    }
+
+    /// A further marked-content id for the currently open element, for its
+    /// content after an inline link closed the previous sequence.
+    pub fn continue_current(&mut self, page_idx: usize) -> u32 {
+        let elem_idx = *self.parent_stack.last().unwrap_or(&0);
+        let mcid = self.next_mcid(page_idx);
+        self.elements[elem_idx]
+            .kids
+            .push(StructKid::MarkedContent { page_idx, mcid });
+        self.mcid_to_struct.push((page_idx, mcid, elem_idx));
+        mcid
+    }
+
+    fn next_mcid(&mut self, page_idx: usize) -> u32 {
+        let mcid = self.page_mcid_counters[page_idx];
+        self.page_mcid_counters[page_idx] += 1;
+        mcid
     }
 
     /// Attach a link annotation to its /Link structure element: add an OBJR

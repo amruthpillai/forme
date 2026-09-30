@@ -1594,6 +1594,11 @@ impl PdfWriter {
         // own ink (borders, row backgrounds) must be marked /Artifact and
         // only its children carry tagged content.
         let mut artifact_own_draw = false;
+        // Inline /Link elements created for this element's text, in drawing
+        // order, and the role its marked content opened with: the text writer
+        // closes that content around each link's words and reopens it after.
+        let mut inline_links: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        let mut bdc_role: Option<&'static str> = None;
         let tagged_mcid = if let Some(ref mut tb) = tag_builder {
             if let Some(ref nt) = element.node_type {
                 if nt == "Watermark" {
@@ -1631,7 +1636,8 @@ impl PdfWriter {
                         if let DrawCommand::Text { ref lines, .. } = element.draw {
                             for line in lines {
                                 for span in Self::inline_link_spans(line) {
-                                    tb.add_inline_link(page_idx, &span.href);
+                                    inline_links
+                                        .push_back(tb.add_inline_link(page_idx, &span.href));
                                 }
                             }
                         }
@@ -1646,6 +1652,7 @@ impl PdfWriter {
                                 tb.map_role_public(nt, is_header)
                             };
                             let _ = writeln!(stream, "/{} <</MCID {}>> BDC", role, mcid);
+                            bdc_role = Some(role);
                             Some(mcid)
                         }
                         None => {
@@ -1918,6 +1925,13 @@ impl PdfWriter {
                 // a line sets it, the next line without it resets to 0.
                 // Text that never sets it emits nothing, as before.
                 let mut tw_set = false;
+                // Tagged text with inline links: each link's words are drawn
+                // inside its own /Link marked content (#157). Groups then also
+                // split where a link starts or ends, and at each boundary the
+                // text object and the marked content are closed and reopened
+                // (marked content may not cross BT/ET). Everything else takes
+                // the untouched path below.
+                let tag_links = bdc_role.is_some() && !inline_links.is_empty();
                 for line in lines {
                     if line.glyphs.is_empty() {
                         continue;
@@ -1925,7 +1939,13 @@ impl PdfWriter {
 
                     // Group consecutive glyphs by (font_family, font_weight, font_style, font_size, color)
                     // to support multi-font text runs
-                    let groups = Self::group_glyphs_by_style(&line.glyphs);
+                    let groups = Self::group_glyphs(&line.glyphs, tag_links);
+                    let group_links = if tag_links {
+                        Self::group_link_runs(&groups)
+                    } else {
+                        vec![None; groups.len()]
+                    };
+                    let mut open_link: Option<&str> = None;
                     let pdf_y = page_height - line.y;
 
                     let _ = writeln!(stream, "BT");
@@ -1947,7 +1967,30 @@ impl PdfWriter {
                     // Track group spans for per-group text decoration
                     let mut group_spans: Vec<(f64, f64, TextDecoration, Color)> = Vec::new();
 
-                    for group in &groups {
+                    for (gi, group) in groups.iter().enumerate() {
+                        let want = group_links[gi];
+                        if want != open_link {
+                            let _ = writeln!(stream, "ET\nEMC");
+                            let role = bdc_role.unwrap_or("Span");
+                            let tb = tag_builder.as_mut().expect("tag_links implies tagging");
+                            let link = want.and_then(|_| inline_links.pop_front());
+                            match link {
+                                Some(idx) => {
+                                    let mcid = tb.attach_inline_link(idx, page_idx);
+                                    let _ = writeln!(stream, "/Link <</MCID {}>> BDC", mcid);
+                                    open_link = want;
+                                }
+                                None => {
+                                    let mcid = tb.continue_current(page_idx);
+                                    let _ = writeln!(stream, "/{} <</MCID {}>> BDC", role, mcid);
+                                    open_link = None;
+                                }
+                            }
+                            // A new text object starts at the identity matrix.
+                            let _ = writeln!(stream, "BT");
+                            tm_x = 0.0;
+                            tm_y = 0.0;
+                        }
                         let first = &group[0];
                         let glyph_color = first.color.unwrap_or(*color);
 
@@ -2074,6 +2117,19 @@ impl PdfWriter {
                     }
 
                     let _ = writeln!(stream, "ET");
+                    // A line that ends inside a link hands the rest of the
+                    // element (its decorations, the next line) back to the
+                    // element's own marked content.
+                    if open_link.is_some() {
+                        let tb = tag_builder.as_mut().expect("tag_links implies tagging");
+                        let mcid = tb.continue_current(page_idx);
+                        let _ = writeln!(
+                            stream,
+                            "EMC\n/{} <</MCID {}>> BDC",
+                            bdc_role.unwrap_or("Span"),
+                            mcid
+                        );
+                    }
 
                     // Draw per-group text decorations
                     for (span_x, span_end_x, dec, dec_color) in &group_spans {
@@ -2136,6 +2192,14 @@ impl PdfWriter {
                 // text is drawn next on this page.
                 if tw_set {
                     let _ = writeln!(stream, "0 Tw");
+                }
+                // Every created /Link must be in the tree: its annotation
+                // points at it. One whose words were never drawn is placed
+                // without content.
+                if let Some(tb) = tag_builder.as_mut() {
+                    while let Some(idx) = inline_links.pop_front() {
+                        tb.attach_inline_link_without_content(idx);
+                    }
                 }
 
                 if needs_opacity {
@@ -4260,6 +4324,12 @@ impl PdfWriter {
     /// Group consecutive glyphs by (font_family, font_weight, font_style, font_size, color)
     /// for multi-font text run rendering.
     fn group_glyphs_by_style(glyphs: &[PositionedGlyph]) -> Vec<Vec<&PositionedGlyph>> {
+        Self::group_glyphs(glyphs, false)
+    }
+
+    /// Group consecutive glyphs by style; with `split_on_href`, also where
+    /// the per-glyph href changes, so a link's words form their own groups.
+    fn group_glyphs(glyphs: &[PositionedGlyph], split_on_href: bool) -> Vec<Vec<&PositionedGlyph>> {
         if glyphs.is_empty() {
             return vec![];
         }
@@ -4276,7 +4346,8 @@ impl PdfWriter {
                 && (glyph.font_size - prev.font_size).abs() < 0.01
                 && Self::colors_equal(&glyph.color, &prev.color)
                 && std::mem::discriminant(&glyph.text_decoration)
-                    == std::mem::discriminant(&prev.text_decoration);
+                    == std::mem::discriminant(&prev.text_decoration)
+                && (!split_on_href || glyph.href == prev.href);
 
             if same_style {
                 current_group.push(glyph);
@@ -4287,6 +4358,35 @@ impl PdfWriter {
         }
         groups.push(current_group);
         groups
+    }
+
+    /// For each group, the href of the inline link it is drawn in, or `None`.
+    /// A link is a maximal run of groups with the same non-empty href; a run
+    /// of nothing but whitespace is not one, matching `inline_link_spans`,
+    /// which drops it (no ink, so no annotation and no /Link element).
+    fn group_link_runs<'a>(groups: &[Vec<&'a PositionedGlyph>]) -> Vec<Option<&'a str>> {
+        let hrefs: Vec<Option<&'a str>> = groups
+            .iter()
+            .map(|g| g[0].href.as_deref().filter(|h| !h.is_empty()))
+            .collect();
+        let mut out = vec![None; groups.len()];
+        let mut i = 0;
+        while i < groups.len() {
+            let mut j = i + 1;
+            while j < groups.len() && hrefs[j] == hrefs[i] {
+                j += 1;
+            }
+            let inked = groups[i..j]
+                .iter()
+                .any(|g| g.iter().any(|gl| !gl.char_value.is_whitespace()));
+            if hrefs[i].is_some() && inked {
+                for slot in &mut out[i..j] {
+                    *slot = hrefs[i];
+                }
+            }
+            i = j;
+        }
+        out
     }
 
     fn colors_equal(a: &Option<Color>, b: &Option<Color>) -> bool {
