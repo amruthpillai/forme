@@ -15823,7 +15823,10 @@ fn test_redaction_finds_text_drawn_with_tj_where_it_is_drawn() {
             .expect("the S of Secret")
             .x_offset;
     let pdf = liberation_pdf(text);
-    assert!(decompress_pdf_streams(&pdf).contains(" TJ"), "precondition: drawn with TJ");
+    assert!(
+        decompress_pdf_streams(&pdf).contains(" TJ"),
+        "precondition: drawn with TJ"
+    );
     let regions = forme::find_text_regions(
         &pdf,
         &[RedactionPattern {
