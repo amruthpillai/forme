@@ -1615,7 +1615,12 @@ impl PdfWriter {
                 } else {
                     let is_header = element.is_header_row;
                     let href = element.href.as_deref();
-                    let mcid = tb.begin_element(
+                    // A wrapper's content is all in its children: its own draw
+                    // is nothing, or a box whose ink is marked /Artifact below.
+                    // It gets no MCID, so no child's sequence nests in its.
+                    let wrapper = !element.children.is_empty()
+                        && matches!(element.draw, DrawCommand::None | DrawCommand::Rect { .. });
+                    let mcid = tb.begin_element_as(
                         nt,
                         is_header,
                         element.alt.as_deref(),
@@ -1624,6 +1629,7 @@ impl PdfWriter {
                         element.col_span,
                         element.list_numbering,
                         element.actual_text.as_deref(),
+                        wrapper,
                     );
                     // Register bookmark anchors against the element just
                     // opened, so internal links can target it with a
