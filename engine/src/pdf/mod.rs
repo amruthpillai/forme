@@ -1912,6 +1912,12 @@ impl PdfWriter {
                     }
                 }
 
+                // `Tw` is text state: it survives ET and only Q restores it.
+                // A line that sets none (a justified paragraph's last line)
+                // was drawn with the previous line's spacing (#162), so once
+                // a line sets it, the next line without it resets to 0.
+                // Text that never sets it emits nothing, as before.
+                let mut tw_set = false;
                 for line in lines {
                     if line.glyphs.is_empty() {
                         continue;
@@ -1927,6 +1933,10 @@ impl PdfWriter {
                     // Set word spacing for justification (PDF Tw operator)
                     if line.word_spacing.abs() > 0.001 {
                         let _ = writeln!(stream, "{:.4} Tw", line.word_spacing);
+                        tw_set = true;
+                    } else if tw_set {
+                        let _ = writeln!(stream, "0 Tw");
+                        tw_set = false;
                     }
 
                     // Track current text matrix position for relative Td moves
@@ -2046,15 +2056,14 @@ impl PdfWriter {
                         // Record span for per-group text decoration
                         let group_start_x = x_cursor;
 
-                        // Advance x_cursor past this group using shaped advances
-                        // Account for word_spacing on spaces (Tw adds to each space char)
+                        // Advance x_cursor past this group. Glyph offsets already
+                        // include the justification: Tw only makes the drawn
+                        // text match them. Adding word_spacing per space here
+                        // again counted it twice, so the next group and every
+                        // underline were off by it (286pt on a line ending at
+                        // 274, #162).
                         if let Some(last) = group.last() {
-                            let space_count_in_group =
-                                group.iter().filter(|g| g.char_value == ' ').count();
-                            x_cursor = line.x
-                                + last.x_offset
-                                + last.x_advance
-                                + space_count_in_group as f64 * line.word_spacing;
+                            x_cursor = line.x + last.x_offset + last.x_advance;
                         }
 
                         // Check if this group has text decoration
@@ -2120,6 +2129,13 @@ impl PdfWriter {
                             );
                         }
                     }
+                }
+
+                // A paragraph whose last line here is stretched (it goes on
+                // to the next page) must not hand its spacing to whatever
+                // text is drawn next on this page.
+                if tw_set {
+                    let _ = writeln!(stream, "0 Tw");
                 }
 
                 if needs_opacity {

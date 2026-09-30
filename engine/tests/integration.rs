@@ -15054,3 +15054,214 @@ fn docinfo_emitted_for_subject_alone() {
     );
     assert!(text.contains("/Info "), "the trailer must reference /Info");
 }
+
+// ─── #162: justified text word spacing ─────────────────────────
+
+/// A 220pt-wide justified paragraph (the #162 repro).
+fn justified_paragraph(text: Node) -> Document {
+    default_doc(vec![Node {
+        kind: NodeKind::View,
+        style: Style {
+            width: Some(Dimension::Pt(220.0)),
+            ..Default::default()
+        },
+        children: vec![text],
+        id: None,
+        source_location: None,
+        bookmark: None,
+        href: None,
+        alt: None,
+    }])
+}
+
+/// Replays the content stream's text state and returns the word spacing
+/// (`Tw`) in effect at each text-showing operator, in order. `Tw` is text
+/// state: it persists across BT/ET and only q/Q restores it.
+fn tw_at_each_show(stream: &str) -> Vec<f64> {
+    let mut stack = vec![0.0_f64];
+    let mut shown = Vec::new();
+    for line in stream.lines() {
+        let t = line.trim();
+        if t == "q" {
+            let top = *stack.last().unwrap();
+            stack.push(top);
+        } else if t == "Q" {
+            stack.pop();
+            if stack.is_empty() {
+                stack.push(0.0);
+            }
+        } else if let Some(v) = t.strip_suffix(" Tw") {
+            *stack.last_mut().unwrap() = v.trim().parse().unwrap();
+        } else if t.ends_with(" Tj") || t.ends_with(" TJ") {
+            shown.push(*stack.last().unwrap());
+        }
+    }
+    shown
+}
+
+/// #162: the last line of a justified paragraph sets no `Tw`, so it used
+/// to be drawn with the previous line's word spacing (every gap 1.56pt too
+/// wide in the repro). It must be set with natural spacing.
+#[test]
+fn test_justified_last_line_is_drawn_with_natural_word_spacing() {
+    let doc = justified_paragraph(Node {
+        kind: NodeKind::Text {
+            content: "The quick brown fox jumps over the lazy dog and keeps running across the field until the end.".to_string(),
+            href: None,
+            runs: vec![],
+        },
+        style: Style {
+            font_size: Some(11.0),
+            text_align: Some(TextAlign::Justify),
+            ..Default::default()
+        },
+        children: vec![],
+        id: None,
+        source_location: None,
+        bookmark: None,
+        href: None,
+        alt: None,
+    });
+    let stream = decompress_pdf_streams(&render_to_pdf(&doc));
+    let tw = tw_at_each_show(&stream);
+    assert!(tw.len() >= 3, "expected a multi-line paragraph, got {tw:?}");
+    assert!(
+        tw[..tw.len() - 1].iter().all(|w| *w > 0.0),
+        "precondition: the stretched lines carry word spacing, got {tw:?}"
+    );
+    assert_eq!(
+        *tw.last().unwrap(),
+        0.0,
+        "the last line must be drawn at natural word spacing, got {tw:?}"
+    );
+}
+
+/// A left-aligned paragraph after a justified one must not inherit the
+/// justified paragraph's word spacing either.
+#[test]
+fn test_text_after_a_justified_paragraph_has_no_word_spacing() {
+    let justified = Node {
+        kind: NodeKind::Text {
+            content: "The quick brown fox jumps over the lazy dog and keeps running across the field until the end.".to_string(),
+            href: None,
+            runs: vec![],
+        },
+        style: Style {
+            font_size: Some(11.0),
+            text_align: Some(TextAlign::Justify),
+            ..Default::default()
+        },
+        children: vec![],
+        id: None,
+        source_location: None,
+        bookmark: None,
+        href: None,
+        alt: None,
+    };
+    let doc = default_doc(vec![Node {
+        kind: NodeKind::View,
+        style: Style {
+            width: Some(Dimension::Pt(220.0)),
+            ..Default::default()
+        },
+        children: vec![
+            justified,
+            make_text("A plain left-aligned line after it.", 11.0),
+        ],
+        id: None,
+        source_location: None,
+        bookmark: None,
+        href: None,
+        alt: None,
+    }]);
+    let stream = decompress_pdf_streams(&render_to_pdf(&doc));
+    let tw = tw_at_each_show(&stream);
+    assert_eq!(*tw.last().unwrap(), 0.0, "got {tw:?}");
+}
+
+/// #162 (related): glyph offsets on a justified line already include the
+/// justification, and the writer added word spacing per space on top, so
+/// each style group after the first started off by it and every underline
+/// on a justified line overshot or fell short (286.17 on a line ending at
+/// 274). Every justified line but the last fills the box, so its furthest
+/// underline must end at the right edge (54 + 220).
+#[test]
+fn test_justified_multi_style_line_reaches_the_right_edge() {
+    let run = |content: &str, weight: u32| TextRun {
+        content: content.to_string(),
+        style: Style {
+            font_weight: Some(weight),
+            text_decoration: Some(TextDecoration::Underline),
+            ..Default::default()
+        },
+        href: None,
+    };
+    let doc = justified_paragraph(Node {
+        kind: NodeKind::Text {
+            content: String::new(),
+            href: None,
+            runs: vec![
+                run("The quick brown fox jumps ", 400),
+                run(
+                    "over the lazy dog and keeps running across the field until the end.",
+                    700,
+                ),
+            ],
+        },
+        style: Style {
+            font_size: Some(11.0),
+            text_align: Some(TextAlign::Justify),
+            ..Default::default()
+        },
+        children: vec![],
+        id: None,
+        source_location: None,
+        bookmark: None,
+        href: None,
+        alt: None,
+    });
+    let stream = decompress_pdf_streams(&render_to_pdf(&doc));
+    // Underlines are `x y m` / `x y l` pairs; take the first line's (the
+    // highest y) and its furthest right end.
+    let mut segs: Vec<(f64, f64)> = Vec::new(); // (y, end_x)
+    let lines: Vec<&str> = stream.lines().collect();
+    for w in lines.windows(2) {
+        if let (Some(m), Some(l)) = (w[0].strip_suffix(" m"), w[1].strip_suffix(" l")) {
+            let m: Vec<f64> = m
+                .split_whitespace()
+                .filter_map(|v| v.parse().ok())
+                .collect();
+            let l: Vec<f64> = l
+                .split_whitespace()
+                .filter_map(|v| v.parse().ok())
+                .collect();
+            if m.len() == 2 && l.len() == 2 && (m[1] - l[1]).abs() < 0.01 {
+                segs.push((l[1], l[0]));
+            }
+        }
+    }
+    let mut ys: Vec<f64> = segs.iter().map(|s| s.0).collect();
+    ys.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    ys.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+    assert!(
+        ys.len() >= 3,
+        "precondition: a multi-line paragraph, got {segs:?}"
+    );
+    let on = |y: f64| -> Vec<f64> {
+        segs.iter()
+            .filter(|s| (s.0 - y).abs() < 0.01)
+            .map(|s| s.1)
+            .collect()
+    };
+    assert!(
+        on(ys[0]).len() >= 2,
+        "precondition: two style groups on line one, got {segs:?}"
+    );
+    for y in &ys[..ys.len() - 1] {
+        let end = on(*y).into_iter().fold(f64::MIN, f64::max);
+        assert!(
+            (end - 274.0).abs() < 0.5,
+            "a justified line's underline should end at the right edge 274, ended at {end:.2} (all: {segs:?})"
+        );
+    }
+}
