@@ -469,13 +469,17 @@ pub fn find_breaks(items: &[Item], config: &Config) -> Option<Vec<LineSolution>>
                 }
 
                 // Compute demerits for this break
-                let penalty_val = match item {
-                    Item::Penalty { penalty, .. } => *penalty,
-                    _ => 0.0,
-                };
                 let flagged = match item {
                     Item::Penalty { flagged, .. } => *flagged,
                     _ => false,
+                };
+                // A hyphen break costs `config.hyphen_penalty`. The items
+                // carry the same default, but reading them alone left the
+                // setting with no effect.
+                let penalty_val = match item {
+                    Item::Penalty { .. } if flagged => config.hyphen_penalty,
+                    Item::Penalty { penalty, .. } => *penalty,
+                    _ => 0.0,
                 };
 
                 let badness = 100.0 * ratio.abs().powi(3);
@@ -990,6 +994,51 @@ mod tests {
         let chars: Vec<char> = text.chars().collect();
         let widths = vec![char_width; chars.len()];
         (chars, widths)
+    }
+
+    /// `Config::hyphen_penalty` was never read: every hyphen break cost the
+    /// literal 50 its items carried, so the setting did nothing. Any finite
+    /// penalty still allows a hyphen that no unhyphenated layout can avoid,
+    /// so a rewarding (negative) penalty is the probe: it must hyphenate
+    /// somewhere the default does not.
+    #[test]
+    fn test_config_hyphen_penalty_is_applied() {
+        let text = "Internationalization considerations notwithstanding, comprehensive documentation remains extraordinarily indispensable.";
+        let (chars, widths) = simple_items(text, 5.0);
+        let break_opps = super::super::compute_break_opportunities(text);
+        let items = build_items(
+            &chars,
+            &widths,
+            5.0,
+            crate::style::Hyphens::Auto,
+            &break_opps,
+            Some("en"),
+        );
+        let hyphenated = |line_width: f64, penalty: f64| -> usize {
+            let config = Config {
+                line_width,
+                hyphen_penalty: penalty,
+                ..Default::default()
+            };
+            find_breaks(&items, &config)
+                .map(|s| s.iter().filter(|s| s.is_hyphenated).count())
+                .unwrap_or(0)
+        };
+        let mut more_somewhere = false;
+        for w in (150..=320).step_by(5) {
+            let w = w as f64;
+            let default = hyphenated(w, Config::default().hyphen_penalty);
+            let rewarded = hyphenated(w, -1000.0);
+            assert!(
+                rewarded >= default,
+                "width {w}: {rewarded} hyphens rewarded vs {default} by default"
+            );
+            more_somewhere |= rewarded > default;
+        }
+        assert!(
+            more_somewhere,
+            "hyphen_penalty changed nothing at any width: the setting is not applied"
+        );
     }
 
     #[test]
