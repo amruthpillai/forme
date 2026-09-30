@@ -1,7 +1,7 @@
 {
   "version": 1,
   "producer": "formepdf",
-  "createdAt": "2026-09-30T02:29:16.633Z",
+  "createdAt": "2026-09-30T02:58:32.957Z",
   "pageCount": 3,
   "pages": [
     {
@@ -710,7 +710,7 @@
         "x": 60,
         "y": 81,
         "width": 475.3,
-        "height": 566.8
+        "height": 422.8
       },
       "order": 6,
       "parentId": null,
@@ -871,5 +871,5 @@
       "confidence": 1
     }
   ],
-  "contentHash": "sha256:11cb52afbbb2714ffa086a9d64f67fe8000bf6795c8e1b42f82db29edf9e0df0"
+  "contentHash": "sha256:af3a55d405517fe88338d6e6713b4e51692772f3b643ac0a1e2fdb51594206a5"
 }

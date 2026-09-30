@@ -409,6 +409,21 @@ impl LayoutInfo {
     }
 }
 
+/// A fixed header/footer node, its measured height, and the resolved style
+/// of the parent it was declared in.
+///
+/// Fixed content is laid out again on every page by `inject_fixed_elements`,
+/// long after the tree walk that knew its parent. Without the parent style it
+/// was resolved against nothing, so it lost everything inherited (the
+/// Document's default style, the Page's style): a footer painted Helvetica 12
+/// black under a document set to another font, size and colour (issue #160),
+/// while its height had been MEASURED with the inherited style.
+pub(crate) type FixedEntry = (Node, f64, Option<ResolvedStyle>);
+
+/// A watermark node and the resolved style of the parent it was declared in
+/// (see [`FixedEntry`]; watermarks are injected per page the same way).
+pub(crate) type WatermarkEntry = (Node, Option<ResolvedStyle>);
+
 /// A fully laid-out page ready for PDF serialization.
 #[derive(Debug, Clone)]
 pub struct LayoutPage {
@@ -416,11 +431,11 @@ pub struct LayoutPage {
     pub height: f64,
     pub elements: Vec<LayoutElement>,
     /// Fixed header nodes to inject after layout (internal use).
-    pub(crate) fixed_header: Vec<(Node, f64)>,
+    pub(crate) fixed_header: Vec<FixedEntry>,
     /// Fixed footer nodes to inject after layout (internal use).
-    pub(crate) fixed_footer: Vec<(Node, f64)>,
+    pub(crate) fixed_footer: Vec<FixedEntry>,
     /// Watermark nodes to inject after layout (internal use).
-    pub(crate) watermarks: Vec<Node>,
+    pub(crate) watermarks: Vec<WatermarkEntry>,
     /// Page config needed for fixed element layout (internal use).
     pub(crate) config: PageConfig,
     /// The page's NAME (CSS `page` property), for fixed-element scoping.
@@ -873,9 +888,65 @@ pub struct PositionedGlyph {
     pub text_decoration: TextDecoration,
     /// Letter spacing applied to this glyph.
     pub letter_spacing: f64,
-    /// For ligature glyphs, the full cluster text (e.g., "fi" for an fi ligature).
-    /// `None` for 1:1 char-to-glyph mappings.
+    /// For glyphs of a cluster spanning several chars, the full cluster text
+    /// (e.g., "fi" for an fi ligature). `None` for 1:1 char-to-glyph mappings.
     pub cluster_text: Option<String>,
+    /// True when this glyph ALONE stands for every char of `cluster_text`: a
+    /// many-to-one substitution such as the "ffi" ligature. The PDF writer
+    /// maps such a glyph to its whole cluster in the ToUnicode CMap, so text
+    /// extraction reads "office" and not "ofice" (issue #156).
+    ///
+    /// False for glyphs that SHARE a multi-char cluster with other glyphs
+    /// (Indic reordering, base plus mark). Those carry the same
+    /// `cluster_text` on every glyph, so no single one of them may claim the
+    /// whole string in the CMap: a shared matra glyph would otherwise map to
+    /// whichever base it was first seen with.
+    pub ligature: bool,
+}
+
+/// The `(cluster_text, ligature)` pair for each shaped glyph, in glyph order.
+///
+/// A cluster runs from its start index up to the next LARGER cluster start
+/// among all glyphs, or to the end of `chars`. Taking the next larger start,
+/// rather than the start of the next glyph in output order, matters for RTL:
+/// shaped RTL output is in visual order, so cluster values DESCEND and "the
+/// next glyph's cluster" is the previous cluster, which used to give a lam-alef
+/// ligature the text of every char after it.
+///
+/// A multi-char cluster that owns exactly one glyph is a ligature; that glyph
+/// gets the cluster text and `ligature = true` regardless of the glyph count
+/// of the line. Glyphs of a multi-char cluster with several glyphs keep the
+/// long-standing behaviour: every one of them carries the cluster text when
+/// the run has fewer glyphs than chars (so `LayoutInfo` and the render audit
+/// see those chars), and none is a ligature.
+fn cluster_texts(shaped: &[shaping::ShapedGlyph], chars: &[char]) -> Vec<(Option<String>, bool)> {
+    let num_chars = chars.len();
+    let fewer_glyphs_than_chars = shaped.len() < num_chars;
+    let mut starts: Vec<u32> = shaped.iter().map(|g| g.cluster).collect();
+    starts.sort_unstable();
+
+    shaped
+        .iter()
+        .map(|sg| {
+            let first = starts.partition_point(|&c| c < sg.cluster);
+            let past = starts.partition_point(|&c| c <= sg.cluster);
+            let glyphs_in_cluster = past - first;
+            let start = sg.cluster as usize;
+            let end = starts
+                .get(past)
+                .map_or(num_chars, |&c| c as usize)
+                .min(num_chars);
+            if end <= start + 1 {
+                return (None, false);
+            }
+            let ligature = glyphs_in_cluster == 1;
+            if ligature || fewer_glyphs_than_chars {
+                (Some(chars[start..end].iter().collect()), ligature)
+            } else {
+                (None, false)
+            }
+        })
+        .collect()
 }
 
 /// Shift a layout element and all its nested content (children, text lines)
@@ -1075,10 +1146,10 @@ struct PageCursor {
     content_height: f64,
     y: f64,
     elements: Vec<LayoutElement>,
-    fixed_header: Vec<(Node, f64)>,
-    fixed_footer: Vec<(Node, f64)>,
+    fixed_header: Vec<FixedEntry>,
+    fixed_footer: Vec<FixedEntry>,
     /// Watermark nodes stored for repetition on every page.
-    watermarks: Vec<Node>,
+    watermarks: Vec<WatermarkEntry>,
     content_x: f64,
     content_y: f64,
     /// Extra Y offset applied on continuation pages (e.g. parent view's padding+border)
@@ -1243,8 +1314,8 @@ impl PageCursor {
         let header_height: f64 = cursor
             .fixed_header
             .iter()
-            .filter(|(n, _)| cursor.fixed_applies(n))
-            .map(|(_, h)| *h)
+            .filter(|(n, _, _)| cursor.fixed_applies(n))
+            .map(|(_, h, _)| *h)
             .sum();
         cursor.y = header_height + cursor.continuation_top_offset;
         cursor
@@ -1262,8 +1333,8 @@ impl PageCursor {
         let footer_height: f64 = self
             .fixed_footer
             .iter()
-            .filter(|(n, _)| self.fixed_applies(n))
-            .map(|(_, h)| *h)
+            .filter(|(n, _, _)| self.fixed_applies(n))
+            .map(|(_, h, _)| *h)
             .sum();
         (self.content_height - self.y - footer_height).max(0.0)
     }
@@ -1330,8 +1401,8 @@ impl PageCursor {
         let header_height: f64 = cursor
             .fixed_header
             .iter()
-            .filter(|(n, _)| cursor.fixed_applies(n))
-            .map(|(_, h)| *h)
+            .filter(|(n, _, _)| cursor.fixed_applies(n))
+            .map(|(_, h, _)| *h)
             .sum();
         cursor.y = header_height + cursor.continuation_top_offset;
 
@@ -1603,7 +1674,9 @@ impl LayoutEngine {
                 let height = self.measure_node_height(node, available_width, &style, font_context);
                 match position {
                     FixedPosition::Header => {
-                        cursor.fixed_header.push((node.clone(), height));
+                        cursor
+                            .fixed_header
+                            .push((node.clone(), height, parent_style.cloned()));
                         // Space is only consumed on pages the element
                         // actually appears on (CSS :first suppression,
                         // parity, page-name scoping).
@@ -1613,14 +1686,18 @@ impl LayoutEngine {
                         }
                     }
                     FixedPosition::Footer => {
-                        cursor.fixed_footer.push((node.clone(), height));
+                        cursor
+                            .fixed_footer
+                            .push((node.clone(), height, parent_style.cloned()));
                     }
                 }
             }
 
             NodeKind::Watermark { .. } => {
                 // Watermarks take zero layout height — just store on cursor for injection
-                cursor.watermarks.push(node.clone());
+                cursor
+                    .watermarks
+                    .push((node.clone(), parent_style.cloned()));
             }
 
             NodeKind::TextField {
@@ -2438,7 +2515,7 @@ impl LayoutEngine {
 
             // A. First page — wrap elements from snapshot onward
             let page = &mut pages[initial_page_count];
-            let footer_h: f64 = page.fixed_footer.iter().map(|(_, h)| *h).sum();
+            let footer_h: f64 = page.fixed_footer.iter().map(|(_, h, _)| *h).sum();
             let page_content_bottom =
                 page.config.margin.top + (page.height - page.config.margin.vertical()) - footer_h;
             let our_elements: Vec<LayoutElement> = drain_since(&mut page.elements, snapshot);
@@ -2469,9 +2546,9 @@ impl LayoutEngine {
 
             // B. Intermediate pages — wrap ALL elements
             for page in &mut pages[initial_page_count + 1..] {
-                let header_h: f64 = page.fixed_header.iter().map(|(_, h)| *h).sum();
+                let header_h: f64 = page.fixed_header.iter().map(|(_, h, _)| *h).sum();
                 let content_top = page.config.margin.top + header_h;
-                let footer_h: f64 = page.fixed_footer.iter().map(|(_, h)| *h).sum();
+                let footer_h: f64 = page.fixed_footer.iter().map(|(_, h, _)| *h).sum();
                 let content_bottom = page.config.margin.top
                     + (page.height - page.config.margin.vertical())
                     - footer_h;
@@ -2503,7 +2580,7 @@ impl LayoutEngine {
             // C. Current page (cursor.elements) — wrap ALL elements
             let all_elements: Vec<LayoutElement> = std::mem::take(&mut cursor.elements);
             if !all_elements.is_empty() || spans_by_height {
-                let header_h: f64 = cursor.fixed_header.iter().map(|(_, h)| *h).sum();
+                let header_h: f64 = cursor.fixed_header.iter().map(|(_, h, _)| *h).sum();
                 let content_top = cursor.content_y + header_h;
                 let rect_height =
                     cursor.content_y + cursor.y + padding.bottom + border.bottom - content_top;
@@ -3960,8 +4037,8 @@ impl LayoutEngine {
                 + padding.vertical()
                 + border.vertical();
             let fresh_page_available = cursor.content_height
-                - cursor.fixed_header.iter().map(|(_, h)| *h).sum::<f64>()
-                - cursor.fixed_footer.iter().map(|(_, h)| *h).sum::<f64>();
+                - cursor.fixed_header.iter().map(|(_, h, _)| *h).sum::<f64>()
+                - cursor.fixed_footer.iter().map(|(_, h, _)| *h).sum::<f64>();
             if total_height > cursor.remaining_height()
                 && total_height <= fresh_page_available
                 && cursor.y > 0.0
@@ -4021,8 +4098,8 @@ impl LayoutEngine {
 
             let needed = total_header_h + first_body_h;
             let fresh_page_available = cursor.content_height
-                - cursor.fixed_header.iter().map(|(_, h)| *h).sum::<f64>()
-                - cursor.fixed_footer.iter().map(|(_, h)| *h).sum::<f64>();
+                - cursor.fixed_header.iter().map(|(_, h, _)| *h).sum::<f64>()
+                - cursor.fixed_footer.iter().map(|(_, h, _)| *h).sum::<f64>();
 
             if needed > cursor.remaining_height() && needed <= fresh_page_available {
                 pages.push(cursor.finalize());
@@ -4056,8 +4133,8 @@ impl LayoutEngine {
             // that's a render defect worth saying out loud, not a reason to
             // print empty pages.
             let fresh_page_available = cursor.content_height
-                - cursor.fixed_header.iter().map(|(_, h)| *h).sum::<f64>()
-                - cursor.fixed_footer.iter().map(|(_, h)| *h).sum::<f64>();
+                - cursor.fixed_header.iter().map(|(_, h, _)| *h).sum::<f64>()
+                - cursor.fixed_footer.iter().map(|(_, h, _)| *h).sum::<f64>();
             if row_height > fresh_page_available {
                 self.defect(format!(
                     "render defect: table row needs {row_height:.0}pt but a page holds {fresh_page_available:.0}pt — rows are atomic, so it is placed whole and overflows",
@@ -4172,7 +4249,7 @@ impl LayoutEngine {
 
             // A. The page the table started on — wrap from the snapshot.
             let page = &mut pages[initial_page_count];
-            let footer_h: f64 = page.fixed_footer.iter().map(|(_, h)| *h).sum();
+            let footer_h: f64 = page.fixed_footer.iter().map(|(_, h, _)| *h).sum();
             let page_content_bottom =
                 page.config.margin.top + (page.height - page.config.margin.vertical()) - footer_h;
             let our_elements: Vec<LayoutElement> = drain_since(&mut page.elements, snapshot);
@@ -4187,9 +4264,9 @@ impl LayoutEngine {
 
             // B. Intermediate pages — entirely table content.
             for page in &mut pages[initial_page_count + 1..] {
-                let header_h: f64 = page.fixed_header.iter().map(|(_, h)| *h).sum();
+                let header_h: f64 = page.fixed_header.iter().map(|(_, h, _)| *h).sum();
                 let content_top = page.config.margin.top + header_h;
-                let footer_h: f64 = page.fixed_footer.iter().map(|(_, h)| *h).sum();
+                let footer_h: f64 = page.fixed_footer.iter().map(|(_, h, _)| *h).sum();
                 let content_bottom = page.config.margin.top
                     + (page.height - page.config.margin.vertical())
                     - footer_h;
@@ -4207,7 +4284,7 @@ impl LayoutEngine {
             // C. Current page — everything on it is table content.
             let all_elements: Vec<LayoutElement> = std::mem::take(&mut cursor.elements);
             if !all_elements.is_empty() {
-                let header_h: f64 = cursor.fixed_header.iter().map(|(_, h)| *h).sum();
+                let header_h: f64 = cursor.fixed_header.iter().map(|(_, h, _)| *h).sum();
                 let content_top = cursor.content_y + header_h;
                 cursor.elements.push(make_wrapper(
                     content_top,
@@ -5296,25 +5373,10 @@ impl LayoutEngine {
                             );
                             let scale = style.font_size / units_per_em as f64;
 
-                            for sg in &shaped {
+                            let clusters = cluster_texts(&shaped, &sub_chars);
+                            for (sg, (cluster_text, ligature)) in shaped.iter().zip(clusters) {
                                 let cluster = sg.cluster as usize;
                                 let char_value = sub_chars.get(cluster).copied().unwrap_or(' ');
-
-                                let cluster_text = if shaped.len() < sub_chars.len() {
-                                    let cluster_end =
-                                        self.find_cluster_end(&shaped, sg, sub_chars.len());
-                                    if cluster_end > cluster + 1 {
-                                        Some(
-                                            sub_chars[cluster..cluster_end]
-                                                .iter()
-                                                .collect::<String>(),
-                                        )
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                };
 
                                 let glyph_x = x + sg.x_offset as f64 * scale;
                                 let glyph_y = sg.y_offset as f64 * scale;
@@ -5335,6 +5397,7 @@ impl LayoutEngine {
                                     text_decoration: style.text_decoration,
                                     letter_spacing: style.letter_spacing,
                                     cluster_text,
+                                    ligature,
                                 });
                                 bidi_levels.push(bidi_run.level);
                                 x += advance;
@@ -5370,6 +5433,7 @@ impl LayoutEngine {
                             text_decoration: style.text_decoration,
                             letter_spacing: style.letter_spacing,
                             cluster_text: None,
+                            ligature: false,
                         });
                         bidi_levels.push(bidi_run.level);
                         x += advance;
@@ -5408,21 +5472,10 @@ impl LayoutEngine {
                     if let Some(shaped) =
                         shaping::shape_text_with_direction(&run_text, font_data, run.is_rtl)
                     {
-                        for sg in &shaped {
+                        let clusters = cluster_texts(&shaped, &run_chars);
+                        for (sg, (cluster_text, ligature)) in shaped.iter().zip(clusters) {
                             let cluster = sg.cluster as usize;
                             let char_value = run_chars.get(cluster).copied().unwrap_or(' ');
-
-                            let cluster_text = if shaped.len() < run_chars.len() {
-                                let cluster_end =
-                                    self.find_cluster_end(&shaped, sg, run_chars.len());
-                                if cluster_end > cluster + 1 {
-                                    Some(run_chars[cluster..cluster_end].iter().collect::<String>())
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
 
                             let glyph_x = x + sg.x_offset as f64 * scale;
                             let glyph_y = sg.y_offset as f64 * scale;
@@ -5443,6 +5496,7 @@ impl LayoutEngine {
                                 text_decoration: style.text_decoration,
                                 letter_spacing: style.letter_spacing,
                                 cluster_text,
+                                ligature,
                             });
                             bidi_levels.push(run.level);
 
@@ -5509,6 +5563,7 @@ impl LayoutEngine {
                     text_decoration: style.text_decoration,
                     letter_spacing: style.letter_spacing,
                     cluster_text: None,
+                    ligature: false,
                 }
             })
             .collect();
@@ -5704,6 +5759,7 @@ impl LayoutEngine {
                 text_decoration: sc.text_decoration,
                 letter_spacing: sc.letter_spacing,
                 cluster_text: None,
+                ligature: false,
             });
             bidi_levels.push(if is_rtl {
                 unicode_bidi::Level::rtl()
@@ -5742,23 +5798,10 @@ impl LayoutEngine {
         let mut result = Vec::with_capacity(shaped.len());
         let mut x = 0.0_f64;
 
-        for sg in shaped {
+        let clusters = cluster_texts(shaped, chars);
+        for (sg, (cluster_text, ligature)) in shaped.iter().zip(clusters) {
             let cluster = sg.cluster as usize;
             let char_value = chars.get(cluster).copied().unwrap_or(' ');
-
-            // Determine cluster text for ligatures
-            let cluster_text = if shaped.len() < chars.len() {
-                // There are fewer glyphs than chars: likely ligatures.
-                // Find end of this cluster.
-                let cluster_end = self.find_cluster_end(shaped, sg, chars.len());
-                if cluster_end > cluster + 1 {
-                    Some(chars[cluster..cluster_end].iter().collect::<String>())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
 
             // Use shaped position
             let glyph_x = x + sg.x_offset as f64 * scale;
@@ -5780,6 +5823,7 @@ impl LayoutEngine {
                 text_decoration,
                 letter_spacing,
                 cluster_text,
+                ligature,
             });
 
             x += advance;
@@ -5802,21 +5846,11 @@ impl LayoutEngine {
         let base_x = char_positions.first().copied().unwrap_or(0.0);
         let mut x = 0.0_f64;
 
-        for sg in shaped {
+        let clusters = cluster_texts(shaped, chars);
+        for (sg, (cluster_text, ligature)) in shaped.iter().zip(clusters) {
             let cluster = sg.cluster as usize;
             let sc = styled_chars.get(cluster).unwrap_or(&styled_chars[0]);
             let char_value = chars.get(cluster).copied().unwrap_or(' ');
-
-            let cluster_text = if shaped.len() < chars.len() {
-                let cluster_end = self.find_cluster_end(shaped, sg, chars.len());
-                if cluster_end > cluster + 1 {
-                    Some(chars[cluster..cluster_end].iter().collect::<String>())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
 
             let glyph_x = base_x + x + sg.x_offset as f64 * scale;
             let glyph_y = sg.y_offset as f64 * scale;
@@ -5837,29 +5871,13 @@ impl LayoutEngine {
                 text_decoration: sc.text_decoration,
                 letter_spacing: sc.letter_spacing,
                 cluster_text,
+                ligature,
             });
 
             x += advance;
         }
 
         result
-    }
-
-    /// Find the end index of a cluster in shaped glyphs.
-    fn find_cluster_end(
-        &self,
-        shaped: &[shaping::ShapedGlyph],
-        current: &shaping::ShapedGlyph,
-        num_chars: usize,
-    ) -> usize {
-        // Find the next glyph's cluster value
-        for sg in shaped {
-            if sg.cluster > current.cluster {
-                return sg.cluster as usize;
-            }
-        }
-        // Last glyph: cluster extends to end of text
-        num_chars
     }
 
     /// The ONE image sizing ladder — used by both `layout_image` and
@@ -7630,14 +7648,14 @@ impl LayoutEngine {
                 let cy = page_h / 2.0;
 
                 let mut watermark_elements = Vec::new();
-                for wm_node in &page.watermarks {
+                for (wm_node, wm_parent) in &page.watermarks {
                     if let NodeKind::Watermark {
                         text,
                         font_size,
                         angle,
                     } = &wm_node.kind
                     {
-                        let style = wm_node.style.resolve(None, page_w);
+                        let style = wm_node.style.resolve(wm_parent.as_ref(), page_w);
                         let color = style.color;
                         let opacity = style.opacity;
                         let angle_rad = angle.to_radians();
@@ -7667,7 +7685,9 @@ impl LayoutEngine {
                                 italic,
                             ) as f64;
 
-                            for sg in &shaped_glyphs {
+                            let clusters = cluster_texts(&shaped_glyphs, &text_chars);
+                            for (sg, (cluster_text, ligature)) in shaped_glyphs.iter().zip(clusters)
+                            {
                                 let advance = sg.x_advance as f64 / units_per_em * *font_size;
                                 let cluster_idx = sg.cluster as usize;
                                 let ch = text_chars.get(cluster_idx).copied().unwrap_or(' ');
@@ -7685,7 +7705,8 @@ impl LayoutEngine {
                                     href: None,
                                     text_decoration: TextDecoration::None,
                                     letter_spacing: style.letter_spacing,
-                                    cluster_text: None,
+                                    cluster_text,
+                                    ligature,
                                 });
                                 x_pos += advance + style.letter_spacing;
                             }
@@ -7714,6 +7735,7 @@ impl LayoutEngine {
                                     text_decoration: TextDecoration::None,
                                     letter_spacing: style.letter_spacing,
                                     cluster_text: None,
+                                    ligature: false,
                                 });
                                 x_pos += w + style.letter_spacing;
                             }
@@ -7772,7 +7794,7 @@ impl LayoutEngine {
             // Lay out headers at top of content area
             if !page.fixed_header.is_empty() {
                 let mut hdr_cursor = PageCursor::new(&page.config);
-                for (node, _h) in &page.fixed_header {
+                for (node, _h, parent) in &page.fixed_header {
                     // The enumerate index is the authoritative page number
                     // for First/NotFirst filtering.
                     if !fixed_applies_on(node, page_index, page.page_name.as_deref()) {
@@ -7780,7 +7802,7 @@ impl LayoutEngine {
                     }
                     let cw = hdr_cursor.content_width;
                     let cx = hdr_cursor.content_x;
-                    let style = node.style.resolve(None, cw);
+                    let style = node.style.resolve(parent.as_ref(), cw);
                     self.layout_view(
                         node,
                         &style,
@@ -7806,18 +7828,18 @@ impl LayoutEngine {
                 let total_ftr: f64 = page
                     .fixed_footer
                     .iter()
-                    .filter(|(n, _)| fixed_applies_on(n, page_index, page.page_name.as_deref()))
-                    .map(|(_, h)| *h)
+                    .filter(|(n, _, _)| fixed_applies_on(n, page_index, page.page_name.as_deref()))
+                    .map(|(_, h, _)| *h)
                     .sum();
                 let target_y = ftr_cursor.content_height - total_ftr;
                 // Layout from y=0
-                for (node, _h) in &page.fixed_footer {
+                for (node, _h, parent) in &page.fixed_footer {
                     if !fixed_applies_on(node, page_index, page.page_name.as_deref()) {
                         continue;
                     }
                     let cw = ftr_cursor.content_width;
                     let cx = ftr_cursor.content_x;
-                    let style = node.style.resolve(None, cw);
+                    let style = node.style.resolve(parent.as_ref(), cw);
                     self.layout_view(
                         node,
                         &style,
@@ -8129,6 +8151,78 @@ fn baseline_in_line(line_height: f64, font_size: f64, (ascent, descent): (f64, f
 mod tests {
     use super::*;
     use crate::font::FontContext;
+
+    fn sg(glyph_id: u16, cluster: u32) -> shaping::ShapedGlyph {
+        shaping::ShapedGlyph {
+            glyph_id,
+            cluster,
+            x_advance: 500,
+            y_advance: 0,
+            x_offset: 0,
+            y_offset: 0,
+        }
+    }
+
+    #[test]
+    fn test_cluster_texts_ltr_ligature() {
+        // "office": o, ffi-ligature (cluster 1..4), c, e.
+        let chars: Vec<char> = "office".chars().collect();
+        let shaped = [sg(1, 0), sg(2, 1), sg(3, 4), sg(4, 5)];
+        let got = cluster_texts(&shaped, &chars);
+        assert_eq!(
+            got,
+            vec![
+                (None, false),
+                (Some("ffi".to_string()), true),
+                (None, false),
+                (None, false)
+            ]
+        );
+    }
+
+    /// RTL output is in visual order, so clusters DESCEND. A lam-alef style
+    /// ligature at clusters 1..3 of "abcd" must get "bc", not "bcd" (the old
+    /// code took the first glyph with a larger cluster, which in descending
+    /// order is the LAST cluster of the run).
+    #[test]
+    fn test_cluster_texts_rtl_ligature_uses_next_larger_cluster() {
+        let chars: Vec<char> = "abcd".chars().collect();
+        let shaped = [sg(1, 3), sg(2, 1), sg(3, 0)];
+        let got = cluster_texts(&shaped, &chars);
+        assert_eq!(
+            got,
+            vec![(None, false), (Some("bc".to_string()), true), (None, false)]
+        );
+    }
+
+    /// A ligature is recognised even when another cluster decomposes into two
+    /// glyphs and the line's glyph count equals its char count, which the old
+    /// `glyphs < chars` guard read as "no ligatures here".
+    #[test]
+    fn test_cluster_texts_ligature_found_when_counts_balance() {
+        // chars a b c d: "ab" ligates (1 glyph), "d" decomposes (2 glyphs).
+        let chars: Vec<char> = "abcd".chars().collect();
+        let shaped = [sg(1, 0), sg(2, 2), sg(3, 3), sg(4, 3)];
+        let got = cluster_texts(&shaped, &chars);
+        assert_eq!(got[0], (Some("ab".to_string()), true));
+        assert_eq!(got[1], (None, false));
+        assert_eq!(got[2], (None, false));
+        assert_eq!(got[3], (None, false));
+    }
+
+    /// Several glyphs sharing a multi-char cluster: none is a ligature; each
+    /// carries the cluster text when the run has fewer glyphs than chars,
+    /// as before.
+    #[test]
+    fn test_cluster_texts_multi_glyph_cluster_is_not_a_ligature() {
+        // chars k i x y: cluster 0 = "kix" drawn as 2 glyphs, then y.
+        let chars: Vec<char> = "kixy".chars().collect();
+        let shaped = [sg(1, 0), sg(2, 0), sg(3, 3)];
+        let got = cluster_texts(&shaped, &chars);
+        assert_eq!(got[0], (Some("kix".to_string()), false));
+        assert_eq!(got[1], (Some("kix".to_string()), false));
+        assert_eq!(got[2], (None, false));
+    }
 
     fn make_text(content: &str, font_size: f64) -> Node {
         Node {

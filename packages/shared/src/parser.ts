@@ -610,13 +610,21 @@ function parseList(element: P5Element, ordered: boolean): FormeNode {
 
   const start = typeof props.start === 'number' && props.start >= 1 ? props.start : 1;
 
-  // Children must be ListItems - anything else is silently dropped to
-  // keep the serializer tolerant, matching the react adapter. (Loose
-  // whitespace and `{#if}` anchors between items are too common to be
-  // a real error.)
-  const children = element.childNodes
-    .filter((c): c is P5Element => isElement(c) && c.tagName === 'forme-list-item')
-    .map(c => parseListItem(c));
+  // Children must be ListItems. Loose whitespace and `{#if}` anchors
+  // (comments) between items are dropped quietly as markup noise; any other
+  // element or text is dropped with a warning, matching the react adapter
+  // (issue #161), since the engine only lays out ListItems here.
+  const listName = ordered ? 'OrderedList' : 'UnorderedList';
+  const children: FormeNode[] = [];
+  for (const c of element.childNodes) {
+    if (isElement(c) && c.tagName === 'forme-list-item') {
+      children.push(parseListItem(c));
+    } else if (isElement(c)) {
+      warnDroppedListChild(listName, `<${componentNameOf(c.tagName)}>`);
+    } else if (isText(c) && c.value.trim() !== '') {
+      warnDroppedListChild(listName, `text ${JSON.stringify(c.value.trim())}`);
+    }
+  }
 
   const node: FormeNode = {
     kind: { type: 'List', ordered, marker_type: markerType, start },
@@ -625,6 +633,23 @@ function parseList(element: P5Element, ordered: boolean): FormeNode {
   };
   if (props.bookmark) node.bookmark = props.bookmark;
   return node;
+}
+
+/** `forme-view` -> `View`; any other tag is shown as written. */
+function componentNameOf(tagName: string): string {
+  if (!tagName.startsWith('forme-')) return tagName;
+  return tagName
+    .slice('forme-'.length)
+    .split('-')
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .join('');
+}
+
+function warnDroppedListChild(listName: string, what: string): void {
+  console.warn(
+    `[Forme] <${listName}> dropped ${what}: only <ListItem> children are rendered in a list. `
+    + `Wrap the content in <ListItem>.`,
+  );
 }
 
 function parseListItem(element: P5Element): FormeNode {

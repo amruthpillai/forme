@@ -826,14 +826,19 @@ pub fn html_to_document(html: &str, options: &HtmlOptions) -> (forme::Document, 
             italic: font.italic,
         });
     }
-    if !bands.is_empty() {
-        if let Some(body_view) = doc.children.first_mut() {
-            // Bands go first so the engine registers them before any
-            // content lands on page one.
-            for band in bands.into_iter().rev() {
-                body_view.children.insert(0, band);
-            }
-        }
+    // Bands go first so the engine registers them before any content lands
+    // on page one. They are siblings of <body>, not its children: CSS gives a
+    // margin box the PAGE context as its parent, which inherits from the root
+    // element, never from <body>. Chrome paints a margin box black under
+    // `body { color: #1f2430 }`. While the engine laid Fixed content out with
+    // no parent style at all, nesting them under body happened not to matter;
+    // once Fixed content inherits its parent's style (#160, correct for JSX,
+    // where <Fixed> really is a child of the document), nesting them there
+    // would hand every running header and footer body's colour and font.
+    // This mapper never sees <html>, so the page context carries nothing, and
+    // the document's own default style (unset here) is exactly that.
+    for band in bands.into_iter().rev() {
+        doc.children.insert(0, band);
     }
 
     // Tagging / PDF-UA: the mapper already emits Heading/Table/List/Lbl/Figure

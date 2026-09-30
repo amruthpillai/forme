@@ -50,6 +50,21 @@ use miniz_oxide::deflate::compress_to_vec_zlib;
 /// gated on it in CI). Callers wanting a real date pass `modDate`.
 const DEFAULT_ATTACHMENT_MOD_DATE: &str = "D:20000101000000Z";
 
+/// The producer name, written to BOTH DocInfo `/Producer` and XMP
+/// `pdf:Producer` (and the redaction rewrite of each). One definition,
+/// because PDF/A requires the two to agree and veraPDF does not check this
+/// pair (issue #158: DocInfo said "Forme 0.6" while XMP said "Forme").
+///
+/// Deliberately carries no version. A version here would change every
+/// output byte on every release, breaking byte-identity comparisons across
+/// versions for no rendering change, and a hardcoded one goes stale (which
+/// is how "0.6" outlived 0.6 by nineteen releases).
+pub(crate) const PRODUCER: &str = "Forme";
+
+/// The creating tool, written to DocInfo `/Creator` and XMP
+/// `xmp:CreatorTool`, which PDF/A pairs the same way.
+pub(crate) const CREATOR_TOOL: &str = "Forme";
+
 /// A link annotation to be added to a page.
 struct LinkAnnotation {
     x: f64,
@@ -57,6 +72,15 @@ struct LinkAnnotation {
     width: f64,
     height: f64,
     href: String,
+}
+
+/// A linked span inside one text line: the glyphs of an inline link run
+/// (`<Text>See <Link href>docs</Link></Text>`) that share an href, with the
+/// absolute x extent they are drawn at.
+struct InlineLinkSpan {
+    href: String,
+    x0: f64,
+    x1: f64,
 }
 
 /// A bookmark entry for the PDF outline tree.
@@ -79,14 +103,48 @@ struct FormFieldData {
 
 pub struct PdfWriter;
 
+/// Record the text `glyph` stands for, for the ToUnicode CMap.
+///
+/// A ligature glyph (one glyph for several chars, `PositionedGlyph::ligature`)
+/// stands for its whole cluster, so "ffi" extracts as "ffi" and not "f"
+/// (issue #156). Every other glyph stands for its own char, which for a glyph
+/// sharing a multi-glyph cluster is the cluster's first char, as before.
+///
+/// One glyph ID has ONE CMap entry, so when the same glyph is seen standing
+/// for different text the choice must be deterministic and must not corrupt
+/// ordinary text. Rule: a single-char mapping beats a multi-char one, and
+/// otherwise the first one seen (document order) wins. A glyph the font maps
+/// from a single char is that char everywhere; a multi-char mapping only
+/// survives for glyphs that are never seen alone, which is what a real
+/// ligature glyph is. Without the rule, a glyph seen once in a cluster such as
+/// "e" + U+FE0F would turn every later plain "e" into "e\u{FE0F}".
+fn record_glyph_text(glyph_to_text: &mut HashMap<u16, String>, glyph: &PositionedGlyph) {
+    let text = match &glyph.cluster_text {
+        Some(cluster) if glyph.ligature && !cluster.is_empty() => cluster.clone(),
+        _ => glyph.char_value.to_string(),
+    };
+    match glyph_to_text.entry(glyph.glyph_id) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(text);
+        }
+        std::collections::hash_map::Entry::Occupied(mut slot) => {
+            let existing_is_multi = slot.get().chars().nth(1).is_some();
+            let new_is_single = text.chars().nth(1).is_none();
+            if existing_is_multi && new_is_single {
+                slot.insert(text);
+            }
+        }
+    }
+}
+
 /// Embedding data for a custom TrueType font.
 #[allow(dead_code)]
 struct CustomFontEmbedData {
     ttf_data: Vec<u8>,
     /// Maps original glyph IDs (from shaping) to remapped GIDs in the subset font.
     gid_remap: HashMap<u16, u16>,
-    /// Maps original glyph IDs to their Unicode character(s) for ToUnicode CMap.
-    glyph_to_char: HashMap<u16, char>,
+    /// Maps original glyph IDs to the text each stands for (ToUnicode CMap).
+    glyph_to_text: HashMap<u16, String>,
     /// Legacy fallback: maps chars to subset GIDs (for page number placeholders).
     char_to_gid: HashMap<char, u16>,
     units_per_em: u16,
@@ -100,8 +158,9 @@ struct FontUsage {
     chars: HashSet<char>,
     /// Glyph IDs used per font (from shaped PositionedGlyphs).
     glyph_ids: HashSet<u16>,
-    /// Maps glyph ID → first char it represents (for ToUnicode CMap).
-    glyph_to_char: HashMap<u16, char>,
+    /// Maps glyph ID → the text it stands for (for ToUnicode CMap): one char
+    /// for an ordinary glyph, the whole cluster for a ligature ("ffi").
+    glyph_to_text: HashMap<u16, String>,
 }
 
 /// Tracks allocated PDF objects during writing.
@@ -487,7 +546,7 @@ impl PdfWriter {
                             .unwrap_or_default();
                         // PDF/UA 7.18.1-2 / 7.18.5-2: a link annotation must
                         // carry an alternate description in its /Contents key.
-                        let contents = Self::escape_pdf_string(&format!("Link to {anchor}"));
+                        let contents = Self::encode_text_string(&format!("Link to {anchor}"));
                         // ISO 14289-2 8.8: "All destinations whose target
                         // lies within the current document shall be
                         // structure destinations." Under UA-2 the GoTo also
@@ -505,7 +564,7 @@ impl PdfWriter {
                         };
                         let annot_dict = format!(
                             "<< /Type /Annot /Subtype /Link /Rect {} /Border [0 0 0] \
-                             /F 4 /Contents ({}){} \
+                             /F 4 /Contents {}{} \
                              /A << /S /GoTo /D [{} 0 R /XYZ 0 {:.2} null]{} >> >>",
                             rect, contents, sp_str, bm.page_obj_id, bm.y_pdf, sd_str
                         );
@@ -526,12 +585,16 @@ impl PdfWriter {
                         })
                         .map(|sp| format!(" /StructParent {}", sp))
                         .unwrap_or_default();
+                    // /Contents is a text string; /URI is a 7-bit ASCII
+                    // byte string (ISO 32000-1 Table 206), so it keeps the
+                    // plain literal.
+                    let contents = Self::encode_text_string(&annot.href);
                     let href_esc = Self::escape_pdf_string(&annot.href);
                     let annot_dict = format!(
                         "<< /Type /Annot /Subtype /Link /Rect {} /Border [0 0 0] \
-                         /F 4 /Contents ({}){} \
+                         /F 4 /Contents {}{} \
                          /A << /Type /Action /S /URI /URI ({}) >> >>",
-                        rect, href_esc, sp_str, href_esc
+                        rect, contents, sp_str, href_esc
                     );
                     builder.objects.push(PdfObject {
                         id: annot_obj_id,
@@ -759,19 +822,22 @@ impl PdfWriter {
 
             let fs_obj_id = builder.objects.len();
             let mut fs_data = format!(
-                "<< /Type /Filespec /F ({name}) /UF ({name}) /EF << /F {ef} 0 R >> /AFRelationship /{rel}",
+                "<< /Type /Filespec /F ({name}) /UF {uf} /EF << /F {ef} 0 R >> /AFRelationship /{rel}",
+                // /F is a byte string, /UF the text-string form of the
+                // same name (ISO 32000-1 Table 44).
                 name = Self::escape_pdf_string(&att.name),
+                uf = Self::encode_text_string(&att.name),
                 ef = ef_obj_id,
                 rel = relationship.pdf_name(),
             );
             if let Some(desc) = &att.description {
-                let _ = write!(fs_data, " /Desc ({})", Self::escape_pdf_string(desc));
+                let _ = write!(fs_data, " /Desc {}", Self::encode_text_string(desc));
             } else if builder.pdf_version == crate::model::PdfVersion::V2_0 {
                 // ISO 14289-2 8.14.1: "The Desc entry shall be present on
                 // all file specification dictionaries present in the
                 // EmbeddedFiles name tree." The file name is the honest
                 // default when the author gave no description.
-                let _ = write!(fs_data, " /Desc ({})", Self::escape_pdf_string(&att.name));
+                let _ = write!(fs_data, " /Desc {}", Self::encode_text_string(&att.name));
             }
             fs_data.push_str(" >>");
             builder.objects.push(PdfObject {
@@ -962,9 +1028,9 @@ impl PdfWriter {
                         };
                         let v_str = if let Some(ref v) = value {
                             format!(
-                                " /V ({}) /DV ({})",
-                                Self::escape_pdf_string(v),
-                                Self::escape_pdf_string(v)
+                                " /V {} /DV {}",
+                                Self::encode_text_string(v),
+                                Self::encode_text_string(v)
                             )
                         } else {
                             String::new()
@@ -1019,11 +1085,11 @@ impl PdfWriter {
                         let widget_obj_id = builder.objects.len();
                         let widget_dict = format!(
                             "<< /Type /Annot /Subtype /Widget /FT /Tx \
-                             /T ({}) /Rect {} /P {}\
+                             /T {} /Rect {} /P {}\
                              {} /DA ({}) /Ff {}{} \
                              /MK << /BC [0.6 0.6 0.6] /BG [1 1 1] >> \
                              /AP << /N {} 0 R >> >>",
-                            Self::escape_pdf_string(&field.name),
+                            Self::encode_text_string(&field.name),
                             rect,
                             page_ref,
                             v_str,
@@ -1056,11 +1122,11 @@ impl PdfWriter {
                         let widget_obj_id = builder.objects.len();
                         let widget_dict = format!(
                             "<< /Type /Annot /Subtype /Widget /FT /Btn \
-                             /T ({}) /Rect {} /P {} \
+                             /T {} /Rect {} /P {} \
                              /V /{} /AS /{}{} \
                              /MK << /BC [0.6 0.6 0.6] /CA (4) >> \
                              /AP << /N << /Yes {} 0 R /Off {} 0 R >> >> >>",
-                            Self::escape_pdf_string(&field.name),
+                            Self::encode_text_string(&field.name),
                             rect,
                             page_ref,
                             state,
@@ -1090,11 +1156,11 @@ impl PdfWriter {
                         }
                         let opts_str: String = options
                             .iter()
-                            .map(|o| format!("({})", Self::escape_pdf_string(o)))
+                            .map(|o| Self::encode_text_string(o))
                             .collect::<Vec<_>>()
                             .join(" ");
                         let v_str = if let Some(ref v) = value {
-                            format!(" /V ({})", Self::escape_pdf_string(v))
+                            format!(" /V {}", Self::encode_text_string(v))
                         } else {
                             String::new()
                         };
@@ -1139,12 +1205,12 @@ impl PdfWriter {
                         let widget_obj_id = builder.objects.len();
                         let widget_dict = format!(
                             "<< /Type /Annot /Subtype /Widget /FT /Ch \
-                             /T ({}) /Rect {} /P {} \
+                             /T {} /Rect {} /P {} \
                              /Opt [{}]{} \
                              /DA (/Helv {} Tf 0 g) /Ff {} \
                              /MK << /BC [0.6 0.6 0.6] /BG [1 1 1] >> \
                              /AP << /N {} 0 R >> >>",
-                            Self::escape_pdf_string(&field.name),
+                            Self::encode_text_string(&field.name),
                             rect,
                             page_ref,
                             opts_str,
@@ -1247,8 +1313,8 @@ impl PdfWriter {
                 }
 
                 let parent_dict = format!(
-                    "<< /FT /Btn /T ({}) /Ff {} /Kids [{}] /V /{} >>",
-                    Self::escape_pdf_string(group_name),
+                    "<< /FT /Btn /T {} /Ff {} /Kids [{}] /V /{} >>",
+                    Self::encode_text_string(group_name),
                     flags,
                     kids_refs,
                     Self::escape_pdf_string(&checked_value),
@@ -1398,20 +1464,25 @@ impl PdfWriter {
         // Document metadata lives in the XMP stream, emitted above
         // unconditionally for 2.0.
         let info_obj_id = if pdf_version == crate::model::PdfVersion::V1_7
-            && (metadata.title.is_some() || metadata.author.is_some())
+            && (metadata.title.is_some() || metadata.author.is_some() || metadata.subject.is_some())
         {
             let id = builder.objects.len();
             let mut info = String::from("<< ");
             if let Some(ref title) = metadata.title {
-                let _ = write!(info, "/Title ({}) ", Self::escape_pdf_string(title));
+                let _ = write!(info, "/Title {} ", Self::encode_text_string(title));
             }
             if let Some(ref author) = metadata.author {
-                let _ = write!(info, "/Author ({}) ", Self::escape_pdf_string(author));
+                let _ = write!(info, "/Author {} ", Self::encode_text_string(author));
             }
             if let Some(ref subject) = metadata.subject {
-                let _ = write!(info, "/Subject ({}) ", Self::escape_pdf_string(subject));
+                let _ = write!(info, "/Subject {} ", Self::encode_text_string(subject));
             }
-            let _ = write!(info, "/Producer (Forme 0.6) /Creator (Forme) >>");
+            let _ = write!(
+                info,
+                "/Producer {} /Creator {} >>",
+                Self::encode_text_string(PRODUCER),
+                Self::encode_text_string(CREATOR_TOOL)
+            );
             builder.objects.push(PdfObject {
                 id,
                 data: info.into_bytes(),
@@ -1548,6 +1619,22 @@ impl PdfWriter {
                     // structure destination under UA-2 (ISO 14289-2 8.8).
                     if let Some(ref bm) = element.bookmark {
                         tb.note_bookmark(bm);
+                    }
+                    // Inline links (a linked run inside a paragraph) get a
+                    // /Link structure element each, under this line's
+                    // element, so their annotations can attach to it like
+                    // element-level links do. Same gate as
+                    // `collect_link_annotations`: only when neither this
+                    // element nor an ancestor carries an href, since those
+                    // annotations already cover the whole box.
+                    if href.is_none() && !tb.inside_link() {
+                        if let DrawCommand::Text { ref lines, .. } = element.draw {
+                            for line in lines {
+                                for span in Self::inline_link_spans(line) {
+                                    tb.add_inline_link(page_idx, &span.href);
+                                }
+                            }
+                        }
                     }
                     match mcid {
                         Some(mcid) => {
@@ -3143,14 +3230,14 @@ impl PdfWriter {
                     let usage = font_usage_map.get(key);
                     let used_glyph_ids = usage.map(|u| &u.glyph_ids);
                     let used_chars = usage.map(|u| &u.chars);
-                    let glyph_to_char = usage.map(|u| &u.glyph_to_char);
+                    let glyph_to_text = usage.map(|u| &u.glyph_to_text);
                     let type0_obj_id = Self::write_custom_font_objects(
                         builder,
                         key,
                         data,
                         used_glyph_ids.cloned().unwrap_or_default(),
                         used_chars.cloned().unwrap_or_default(),
-                        glyph_to_char.cloned().unwrap_or_default(),
+                        glyph_to_text.cloned().unwrap_or_default(),
                     )?;
                     builder.font_objects.push((key.clone(), type0_obj_id));
                 }
@@ -3184,7 +3271,7 @@ impl PdfWriter {
                         let usage = font_usage.entry(key).or_insert_with(|| FontUsage {
                             chars: HashSet::new(),
                             glyph_ids: HashSet::new(),
-                            glyph_to_char: HashMap::new(),
+                            glyph_to_text: HashMap::new(),
                         });
                         usage.chars.insert(glyph.char_value);
                         // A page-number sentinel becomes digits at write
@@ -3197,21 +3284,7 @@ impl PdfWriter {
                             usage.chars.extend('0'..='9');
                         }
                         usage.glyph_ids.insert(glyph.glyph_id);
-                        // For ligatures, use the first char of the cluster
-                        usage
-                            .glyph_to_char
-                            .entry(glyph.glyph_id)
-                            .or_insert(glyph.char_value);
-                        // If there's cluster_text, record all chars for this glyph
-                        if let Some(ref ct) = glyph.cluster_text {
-                            // First char already recorded above; cluster_text is for ToUnicode
-                            if let Some(first_char) = ct.chars().next() {
-                                usage
-                                    .glyph_to_char
-                                    .entry(glyph.glyph_id)
-                                    .or_insert(first_char);
-                            }
-                        }
+                        record_glyph_text(&mut usage.glyph_to_text, glyph);
                     }
                 }
             }
@@ -3811,14 +3884,14 @@ impl PdfWriter {
     ///
     /// `used_glyph_ids`: original glyph IDs from shaping (from PositionedGlyph.glyph_id).
     /// `used_chars`: characters used (for char→gid fallback, e.g., page number placeholders).
-    /// `glyph_to_char_map`: maps original glyph ID → first Unicode char (for ToUnicode CMap).
+    /// `glyph_to_text_map`: maps original glyph ID → the text it stands for (for ToUnicode CMap).
     fn write_custom_font_objects(
         builder: &mut PdfBuilder,
         key: &FontKey,
         ttf_data: &[u8],
         used_glyph_ids: HashSet<u16>,
         used_chars: HashSet<char>,
-        glyph_to_char_map: HashMap<u16, char>,
+        glyph_to_text_map: HashMap<u16, String>,
     ) -> Result<usize, FormeError> {
         let face = ttf_parser::Face::parse(ttf_data, 0).map_err(|e| {
             FormeError::FontError(format!(
@@ -3867,17 +3940,21 @@ impl PdfWriter {
         // Build glyph_id→new_gid mapping (for shaped content stream)
         let gid_remap_for_embed = gid_remap.clone();
 
-        // Build new_gid→char mapping for ToUnicode CMap
-        let mut new_gid_to_char: HashMap<u16, char> = HashMap::new();
-        // From shaped glyph→char mapping
-        for (&orig_gid, &ch) in &glyph_to_char_map {
-            if let Some(&new_gid) = gid_remap.get(&orig_gid) {
-                new_gid_to_char.entry(new_gid).or_insert(ch);
+        // Build new_gid→text mapping for ToUnicode CMap
+        let mut new_gid_to_text: HashMap<u16, String> = HashMap::new();
+        // From shaped glyph→text mapping
+        for (orig_gid, text) in &glyph_to_text_map {
+            if let Some(&new_gid) = gid_remap.get(orig_gid) {
+                new_gid_to_text
+                    .entry(new_gid)
+                    .or_insert_with(|| text.clone());
             }
         }
         // Fill in from char→gid mapping too
         for (&ch, &new_gid) in &char_to_gid {
-            new_gid_to_char.entry(new_gid).or_insert(ch);
+            new_gid_to_text
+                .entry(new_gid)
+                .or_insert_with(|| ch.to_string());
         }
 
         let pdf_font_name = Self::sanitize_font_name(&key.family, key.weight, key.italic);
@@ -3961,7 +4038,7 @@ impl PdfWriter {
 
         // 4. ToUnicode CMap
         let tounicode_id = builder.objects.len();
-        let cmap_content = Self::build_tounicode_cmap_from_gids(&new_gid_to_char, &pdf_font_name);
+        let cmap_content = Self::build_tounicode_cmap_from_gids(&new_gid_to_text, &pdf_font_name);
         let compressed_cmap = compress_to_vec_zlib(cmap_content.as_bytes(), 6);
         let mut tounicode_data: Vec<u8> = Vec::new();
         let _ = write!(
@@ -3996,7 +4073,7 @@ impl PdfWriter {
             CustomFontEmbedData {
                 ttf_data: embed_ttf,
                 gid_remap: gid_remap_for_embed,
-                glyph_to_char: glyph_to_char_map,
+                glyph_to_text: glyph_to_text_map,
                 char_to_gid,
                 units_per_em,
                 ascender,
@@ -4041,11 +4118,26 @@ impl PdfWriter {
         result
     }
 
-    /// Build a ToUnicode CMap from new_gid → char mapping.
-    fn build_tounicode_cmap_from_gids(gid_to_char: &HashMap<u16, char>, font_name: &str) -> String {
-        let mut gid_to_unicode: Vec<(u16, u32)> = gid_to_char
+    /// Build a ToUnicode CMap from new_gid → text mapping.
+    ///
+    /// Each destination is the text's UTF-16BE code units, so a ligature
+    /// glyph maps to every char it stands for (`<0005> <006600660069>` for
+    /// "ffi") and a non-BMP char is written as its surrogate pair, both as
+    /// the PDF spec defines bfchar destinations (ISO 32000-1, 9.10.3).
+    fn build_tounicode_cmap_from_gids(
+        gid_to_text: &HashMap<u16, String>,
+        font_name: &str,
+    ) -> String {
+        let mut gid_to_unicode: Vec<(u16, String)> = gid_to_text
             .iter()
-            .map(|(&gid, &ch)| (gid, ch as u32))
+            .filter(|(_, text)| !text.is_empty())
+            .map(|(&gid, text)| {
+                let hex: String = text
+                    .encode_utf16()
+                    .map(|unit| format!("{:04X}", unit))
+                    .collect();
+                (gid, hex)
+            })
             .collect();
         gid_to_unicode.sort_by_key(|(gid, _)| *gid);
 
@@ -4067,8 +4159,8 @@ impl PdfWriter {
         // PDF spec limits beginbfchar to 100 entries per block
         for chunk in gid_to_unicode.chunks(100) {
             let _ = writeln!(cmap, "{} beginbfchar", chunk.len());
-            for &(gid, unicode) in chunk {
-                let _ = writeln!(cmap, "<{:04X}> <{:04X}>", gid, unicode);
+            for (gid, unicode) in chunk {
+                let _ = writeln!(cmap, "<{:04X}> <{}>", gid, unicode);
             }
             let _ = writeln!(cmap, "endbfchar");
         }
@@ -4217,8 +4309,90 @@ impl PdfWriter {
                     continue;
                 }
             }
+            // Inline links: a linked run inside a paragraph lives only on its
+            // glyphs (`PositionedGlyph.href`), never on an element, so each
+            // contiguous linked span gets its own annotation per line. A span
+            // that wraps yields one rect per line it touches.
+            if let DrawCommand::Text { ref lines, .. } = element.draw {
+                for line in lines {
+                    let spans = Self::inline_link_spans(line);
+                    if spans.is_empty() {
+                        continue;
+                    }
+                    // Layout emits one TextLine element per line, whose box
+                    // IS the line box. A multi-line Text command has no
+                    // per-line box, so estimate it around the baseline.
+                    let (top, height) = if lines.len() == 1 {
+                        (element.y, element.height)
+                    } else {
+                        let fs = line.glyphs.first().map(|g| g.font_size).unwrap_or(12.0);
+                        (line.y - fs * 0.8 - (line.height - fs) / 2.0, line.height)
+                    };
+                    for span in spans {
+                        annotations.push(LinkAnnotation {
+                            x: span.x0,
+                            y: page_height - top - height,
+                            width: span.x1 - span.x0,
+                            height,
+                            href: span.href,
+                        });
+                    }
+                }
+            }
             Self::collect_link_annotations(&element.children, page_height, annotations);
         }
+    }
+
+    /// Contiguous runs of glyphs on one line that share a per-glyph href,
+    /// with the x extent they are actually drawn at. Positions mirror the
+    /// text writer (style groups placed at `x_cursor`, `Tw` added per space)
+    /// so the annotation lands on the ink, justified lines included.
+    fn inline_link_spans(line: &TextLine) -> Vec<InlineLinkSpan> {
+        let mut spans: Vec<InlineLinkSpan> = Vec::new();
+        if !line.glyphs.iter().any(|g| g.href.is_some()) {
+            return spans;
+        }
+        let mut x_cursor = line.x;
+        let mut prev_href: Option<&str> = None;
+        for group in Self::group_glyphs_by_style(&line.glyphs) {
+            let first = group[0];
+            let mut spaces = 0usize;
+            for g in &group {
+                let x0 =
+                    x_cursor + (g.x_offset - first.x_offset) + spaces as f64 * line.word_spacing;
+                let x1 = x0 + g.x_advance;
+                if g.char_value == ' ' {
+                    spaces += 1;
+                }
+                let href = g.href.as_deref().filter(|h| !h.is_empty());
+                if let Some(h) = href {
+                    if prev_href != Some(h) {
+                        spans.push(InlineLinkSpan {
+                            href: h.to_string(),
+                            x0: f64::INFINITY,
+                            x1: f64::NEG_INFINITY,
+                        });
+                    }
+                    // Only ink extends the rect: a space at a span's edge
+                    // (the one a wrapped line ends on, or "docs " in the
+                    // source) would widen the target past the text.
+                    if !g.char_value.is_whitespace() {
+                        if let Some(last) = spans.last_mut() {
+                            last.x0 = last.x0.min(x0);
+                            last.x1 = last.x1.max(x1);
+                        }
+                    }
+                }
+                prev_href = href;
+            }
+            if let Some(last) = group.last() {
+                x_cursor =
+                    line.x + last.x_offset + last.x_advance + spaces as f64 * line.word_spacing;
+            }
+        }
+        // A span of nothing but spaces has no ink to link.
+        spans.retain(|s| s.x1 > s.x0);
+        spans
     }
 
     /// Collect form field annotations from layout elements.
@@ -4313,8 +4487,8 @@ impl PdfWriter {
                 format!("/Dest [{} 0 R /XYZ 0 {:.2} null]", bm.page_obj_id, bm.y_pdf)
             };
             let mut dict = format!(
-                "<< /Title ({}) /Parent {} 0 R {}",
-                Self::escape_pdf_string(&bm.title),
+                "<< /Title {} /Parent {} 0 R {}",
+                Self::encode_text_string(&bm.title),
                 outlines_id,
                 dest,
             );
@@ -4416,6 +4590,31 @@ impl PdfWriter {
         s.replace('\\', "\\\\")
             .replace('(', "\\(")
             .replace(')', "\\)")
+    }
+
+    /// Encode a PDF *text string* (ISO 32000-1 7.9.2.2), delimiters
+    /// included. A text string is PDFDocEncoding or UTF-16BE with a BOM;
+    /// raw UTF-8 in a literal is neither, and readers decode it as
+    /// PDFDocEncoding ("Ü" shows as "Ãœ", issue #158).
+    ///
+    /// Printable ASCII (0x20..=0x7E) is identical in PDFDocEncoding, so it
+    /// stays an escaped literal, byte-for-byte what was written before.
+    /// Anything else becomes `<FEFF...>`: UTF-16BE hex with the BOM, with
+    /// surrogate pairs outside the BMP. PDFDocEncoding's Latin-1 range would
+    /// cover some non-ASCII text too, but it differs from Latin-1 in
+    /// 0x7F..=0xA0 and cannot express most scripts, so one rule that is
+    /// always correct beats a second table to keep right.
+    pub(crate) fn encode_text_string(s: &str) -> String {
+        if s.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+            return format!("({})", Self::escape_pdf_string(s));
+        }
+        let mut out = String::with_capacity(6 + s.len() * 4);
+        out.push_str("<FEFF");
+        for unit in s.encode_utf16() {
+            let _ = write!(out, "{unit:04X}");
+        }
+        out.push('>');
+        out
     }
 
     /// Decode an attachment `src`: plain base64, with an optional
@@ -4871,6 +5070,19 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_text_string() {
+        // Printable ASCII: the escaped literal, unchanged from before.
+        assert_eq!(PdfWriter::encode_text_string("A (b)"), "(A \\(b\\))");
+        assert_eq!(PdfWriter::encode_text_string(""), "()");
+        // Non-ASCII: UTF-16BE with a BOM. U+00DC is 00DC.
+        assert_eq!(PdfWriter::encode_text_string("Üb"), "<FEFF00DC0062>");
+        // Outside the BMP: a surrogate pair (U+1D11E -> D834 DD1E).
+        assert_eq!(PdfWriter::encode_text_string("𝄞"), "<FEFFD834DD1E>");
+        // A control character is not printable ASCII and is not left raw.
+        assert_eq!(PdfWriter::encode_text_string("a\nb"), "<FEFF0061000A0062>");
+    }
+
+    #[test]
     fn test_empty_document_produces_valid_pdf() {
         let writer = PdfWriter::new();
         let font_context = FontContext::new();
@@ -4987,6 +5199,7 @@ mod tests {
                                 text_decoration: TextDecoration::None,
                                 letter_spacing: 0.0,
                                 cluster_text: None,
+                                ligature: false,
                             }],
                             word_spacing: 0.0,
                         }],
@@ -5034,6 +5247,7 @@ mod tests {
                                 text_decoration: TextDecoration::None,
                                 letter_spacing: 0.0,
                                 cluster_text: None,
+                                ligature: false,
                             }],
                             word_spacing: 0.0,
                         }],
@@ -5120,10 +5334,10 @@ mod tests {
 
     #[test]
     fn test_tounicode_cmap_format() {
-        // glyph_to_char: maps subset glyph IDs → Unicode chars
+        // glyph_to_text: maps subset glyph IDs → Unicode text
         let mut glyph_to_char = HashMap::new();
-        glyph_to_char.insert(36u16, 'A');
-        glyph_to_char.insert(37u16, 'B');
+        glyph_to_char.insert(36u16, "A".to_string());
+        glyph_to_char.insert(37u16, "B".to_string());
 
         let cmap = PdfWriter::build_tounicode_cmap_from_gids(&glyph_to_char, "TestFont");
 
@@ -5150,6 +5364,94 @@ mod tests {
             cmap.contains("<0000> <FFFF>"),
             "Codespace should be 0000-FFFF"
         );
+    }
+
+    /// Issue #156: a ligature destination carries every char, and a non-BMP
+    /// char is written as its UTF-16 surrogate pair. The old writer emitted
+    /// `{:04X}` of the code point, which for U+1F600 is the odd-length and
+    /// invalid `<1F600>`.
+    #[test]
+    fn test_tounicode_cmap_multi_char_and_non_bmp_destinations() {
+        let mut gid_to_text = HashMap::new();
+        gid_to_text.insert(5u16, "ffi".to_string());
+        gid_to_text.insert(6u16, "Th".to_string());
+        gid_to_text.insert(7u16, "\u{1F600}".to_string());
+
+        let cmap = PdfWriter::build_tounicode_cmap_from_gids(&gid_to_text, "TestFont");
+
+        assert!(cmap.contains("<0005> <006600660069>"), "{cmap}");
+        assert!(cmap.contains("<0006> <00540068>"), "{cmap}");
+        assert!(cmap.contains("<0007> <D83DDE00>"), "{cmap}");
+    }
+
+    fn text_glyph(
+        glyph_id: u16,
+        ch: char,
+        cluster: Option<&str>,
+        ligature: bool,
+    ) -> PositionedGlyph {
+        PositionedGlyph {
+            glyph_id,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            x_advance: 5.0,
+            font_size: 12.0,
+            font_family: "Lig".into(),
+            font_weight: 400,
+            font_style: FontStyle::Normal,
+            char_value: ch,
+            color: None,
+            href: None,
+            text_decoration: TextDecoration::None,
+            letter_spacing: 0.0,
+            cluster_text: cluster.map(str::to_string),
+            ligature,
+        }
+    }
+
+    #[test]
+    fn test_record_glyph_text_ligature_maps_whole_cluster() {
+        let mut map = HashMap::new();
+        record_glyph_text(&mut map, &text_glyph(9, 'f', Some("ffi"), true));
+        assert_eq!(map[&9], "ffi");
+    }
+
+    /// A glyph that shares a multi-glyph cluster is NOT a ligature: it keeps
+    /// its own char even though it carries the cluster text, so a shared
+    /// mark or matra glyph never claims one particular base.
+    #[test]
+    fn test_record_glyph_text_shared_cluster_glyph_keeps_its_char() {
+        let mut map = HashMap::new();
+        record_glyph_text(&mut map, &text_glyph(9, 'k', Some("ki"), false));
+        assert_eq!(map[&9], "k");
+    }
+
+    /// One glyph, two meanings: the single-char meaning wins whichever order
+    /// they are seen in, so a glyph that swallowed a following ignorable char
+    /// once cannot corrupt every other occurrence of that char.
+    #[test]
+    fn test_record_glyph_text_single_char_beats_multi_char() {
+        let mut first_multi = HashMap::new();
+        record_glyph_text(
+            &mut first_multi,
+            &text_glyph(9, 'e', Some("e\u{FE0F}"), true),
+        );
+        record_glyph_text(&mut first_multi, &text_glyph(9, 'e', None, false));
+        assert_eq!(first_multi[&9], "e");
+
+        let mut first_single = HashMap::new();
+        record_glyph_text(&mut first_single, &text_glyph(9, 'e', None, false));
+        record_glyph_text(
+            &mut first_single,
+            &text_glyph(9, 'e', Some("e\u{FE0F}"), true),
+        );
+        assert_eq!(first_single[&9], "e");
+
+        // Between two multi-char meanings, the first one seen stays.
+        let mut two_multi = HashMap::new();
+        record_glyph_text(&mut two_multi, &text_glyph(9, 'f', Some("fi"), true));
+        record_glyph_text(&mut two_multi, &text_glyph(9, 'f', Some("ffi"), true));
+        assert_eq!(two_multi[&9], "fi");
     }
 
     #[test]
@@ -5210,6 +5512,7 @@ mod tests {
                             text_decoration: TextDecoration::None,
                             letter_spacing: 0.0,
                             cluster_text: None,
+                            ligature: false,
                         }],
                         word_spacing: 0.0,
                     }],

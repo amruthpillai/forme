@@ -844,7 +844,10 @@ pub fn redact_pdf(pdf_bytes: &[u8], regions: &[RedactionRegion]) -> Result<Vec<u
     if let Some(info_id) = find_ref_in_bytes(trailer_section, b"/Info") {
         let date = super::certify::format_pdf_date();
         xref_entries.push((info_id, buf.len()));
-        let info = format!("{info_id} 0 obj\n<< /Producer (Forme) /ModDate ({date}) >>\nendobj\n");
+        let info = format!(
+            "{info_id} 0 obj\n<< /Producer {} /ModDate ({date}) >>\nendobj\n",
+            super::PdfWriter::encode_text_string(super::PRODUCER)
+        );
         buf.extend_from_slice(info.as_bytes());
     }
 
@@ -858,12 +861,13 @@ pub fn redact_pdf(pdf_bytes: &[u8], regions: &[RedactionRegion]) -> Result<Vec<u
              <rdf:Description rdf:about=''\n\
              xmlns:pdf='http://ns.adobe.com/pdf/1.3/'\n\
              xmlns:xmp='http://ns.adobe.com/xap/1.0/'>\n\
-             <pdf:Producer>Forme</pdf:Producer>\n\
+             <pdf:Producer>{producer}</pdf:Producer>\n\
              <xmp:ModifyDate>{xmp_date}</xmp:ModifyDate>\n\
              </rdf:Description>\n\
              </rdf:RDF>\n\
              </x:xmpmeta>\n\
-             <?xpacket end='w'?>"
+             <?xpacket end='w'?>",
+            producer = super::PRODUCER
         );
         let xmp_bytes = xmp.as_bytes();
         let compressed = compress_to_vec_zlib(xmp_bytes, 6);
