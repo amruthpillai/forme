@@ -1943,6 +1943,13 @@ pub(crate) fn build_margin_band(
     let widths = margin_box_widths(&present);
     let mut cells: Vec<Node> = Vec::new();
     for slot in [0, 1, 2] {
+        // A zero-width slot is always an absent box: it paints nothing, and
+        // left in, it showed up as a zero-width cell at the page's centre.
+        // An empty slot with width stays; it is the spacer that keeps a
+        // centre box centred.
+        if widths[slot] == 0.0 {
+            continue;
+        }
         let want = slot_pos(slot);
         let align = match slot {
             0 => forme::style::TextAlign::Left,
