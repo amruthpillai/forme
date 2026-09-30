@@ -442,7 +442,10 @@ td.broughtlab { color: #767676; }
 /* Signature caption rows (flex, rules above captions). */
 .sigrow { display: flex; gap: 30pt; align-items: flex-end; padding-top: 19.5pt; }
 .sigcell { border-top: 0.75pt solid #111111; padding-top: 4.5pt; }
-.tt-flush { width: 100%; margin-top: 0; }
+/* table.tt-flush, not .tt-flush: table.tt (0,1,1) outranks a bare class,
+ * so the column-filling width and zero margin never applied and the
+ * totals stack kept its 255pt width inside a narrower column. */
+table.tt-flush { width: 100%; margin-top: 0; }
 .mast-divider { margin-top: 15pt; } /* 20px below masthead */
 .meta-gap { margin-top: 10.5pt; }   /* 14px stacked meta pairs */
 

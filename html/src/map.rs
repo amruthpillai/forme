@@ -1929,23 +1929,35 @@ pub(crate) fn build_margin_band(
     exclude_page_names: Vec<String>,
     warnings: &mut Vec<String>,
 ) -> Node {
+    let slot_pos = |slot: usize| match (top, slot) {
+        (true, 0) => MarginBoxPos::TopLeft,
+        (true, 1) => MarginBoxPos::TopCenter,
+        (true, _) => MarginBoxPos::TopRight,
+        (false, 0) => MarginBoxPos::BottomLeft,
+        (false, 1) => MarginBoxPos::BottomCenter,
+        (false, _) => MarginBoxPos::BottomRight,
+    };
+    let present: Vec<bool> = (0..3)
+        .map(|slot| boxes.iter().any(|b| b.position == slot_pos(slot)))
+        .collect();
+    let widths = margin_box_widths(&present);
     let mut cells: Vec<Node> = Vec::new();
     for slot in [0, 1, 2] {
-        let want = match (top, slot) {
-            (true, 0) => MarginBoxPos::TopLeft,
-            (true, 1) => MarginBoxPos::TopCenter,
-            (true, _) => MarginBoxPos::TopRight,
-            (false, 0) => MarginBoxPos::BottomLeft,
-            (false, 1) => MarginBoxPos::BottomCenter,
-            (false, _) => MarginBoxPos::BottomRight,
-        };
+        // A zero-width slot is always an absent box: it paints nothing, and
+        // left in, it showed up as a zero-width cell at the page's centre.
+        // An empty slot with width stays; it is the spacer that keeps a
+        // centre box centred.
+        if widths[slot] == 0.0 {
+            continue;
+        }
+        let want = slot_pos(slot);
         let align = match slot {
             0 => forme::style::TextAlign::Left,
             1 => forme::style::TextAlign::Center,
             _ => forme::style::TextAlign::Right,
         };
         let mut cell_style = Style {
-            width: Some(Dimension::Percent(100.0 / 3.0)),
+            width: Some(Dimension::Percent(widths[slot])),
             text_align: Some(align),
             ..Default::default()
         };
@@ -2016,6 +2028,37 @@ pub(crate) fn build_margin_band(
         Style::default(),
         vec![band],
     )
+}
+
+/// Widths (percent of the edge) for the left, centre and right margin
+/// boxes, from which of them are present.
+///
+/// CSS Paged Media 6.3.2 resolves these from the boxes' max-content
+/// widths; the mapper does not measure text, so this covers the cases
+/// that need no measurement. An absent box has no content and takes no
+/// room, so a lone box, or a centre box without sides, gets the whole
+/// edge, and two side boxes without a centre split it. A centre box with
+/// any side box keeps equal thirds, which leaves it centred on the page.
+/// Fixed thirds used to wrap a lone centre header Chrome keeps on one line.
+fn margin_box_widths(present: &[bool]) -> [f64; 3] {
+    let third = 100.0 / 3.0;
+    match (present[0], present[1], present[2]) {
+        (false, true, false) => [0.0, 100.0, 0.0],
+        (_, false, _) => {
+            let sides = present[0] as u8 + present[2] as u8;
+            if sides == 0 {
+                [third, third, third]
+            } else {
+                let w = 100.0 / sides as f64;
+                [
+                    if present[0] { w } else { 0.0 },
+                    0.0,
+                    if present[2] { w } else { 0.0 },
+                ]
+            }
+        }
+        _ => [third, third, third],
+    }
 }
 
 // ── Margin collapsing (pass 3) ────────────────────────────────────────

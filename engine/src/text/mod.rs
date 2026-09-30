@@ -1233,7 +1233,7 @@ impl TextLayout {
         }
 
         // Single segment — run KP
-        let items = knuth_plass::build_items(
+        let mut items = knuth_plass::build_items(
             &chars,
             &char_widths,
             hyphen_width,
@@ -1241,6 +1241,10 @@ impl TextLayout {
             &break_opps,
             lang,
         );
+        if !justify {
+            knuth_plass::disallow_shrink(&mut items);
+        }
+        knuth_plass::hang_trailing_letter_spacing(&mut items, |_| letter_spacing);
         let config = knuth_plass::Config {
             line_width: max_width,
             ..Default::default()
@@ -1374,7 +1378,7 @@ impl TextLayout {
             return all_lines;
         }
 
-        let items = knuth_plass::build_items_styled(
+        let mut items = knuth_plass::build_items_styled(
             chars,
             &char_widths,
             hyphen_width,
@@ -1382,6 +1386,10 @@ impl TextLayout {
             &break_opps,
             lang,
         );
+        if !justify {
+            knuth_plass::disallow_shrink(&mut items);
+        }
+        knuth_plass::hang_trailing_letter_spacing(&mut items, |i| chars[i].letter_spacing);
         let config = knuth_plass::Config {
             line_width: max_width,
             ..Default::default()
@@ -2302,6 +2310,106 @@ mod tests {
             truncated[0].width <= 60.0 + 0.1,
             "Should fit within max_width"
         );
+    }
+
+    /// The Northmoor payslip footer: 6.375pt Helvetica in a 236.25pt
+    /// column, left-aligned. Knuth-Plass chose lines that only fit with
+    /// their spaces shrunk, but spaces shrink only when justified, so the
+    /// "period cut-" line rendered 3.9pt past the column.
+    const RAGGED_TEXT: &str = "Payroll, (585) 274-0180 ext. 402. Keep this statement; it is required to support your annual tax return. Address changes must be filed on form F-04 before the period cut-off. Reports submitted more than sixty days after the expense date require an officer's signature.";
+
+    #[test]
+    fn test_optimal_ragged_lines_never_exceed_max_width() {
+        let tl = TextLayout::new();
+        let fc = ctx();
+        for width in [236.25, 200.0, 180.0, 150.0, 120.0] {
+            let lines = tl.break_into_lines_optimal(
+                &fc,
+                RAGGED_TEXT,
+                width,
+                6.375,
+                "Helvetica",
+                400,
+                FontStyle::Normal,
+                0.0,
+                0.0,
+                Hyphens::Manual,
+                Some("en"),
+                false,
+            );
+            for l in &lines {
+                assert!(
+                    l.width <= width + 0.01,
+                    "width {width}: line {:?} is {:.2}pt, wider than the box",
+                    l.text,
+                    l.width
+                );
+            }
+        }
+    }
+
+    /// The Northmoor certificate's signature caption: bold 5.25pt uppercase
+    /// with 0.17em letter-spacing in a 119.45pt cell. "... · QUALITY" is
+    /// 119.815pt only because of the letter-spacing after its final Y,
+    /// which paints nothing; Chrome keeps QUALITY on the first line.
+    #[test]
+    fn test_optimal_trailing_letter_spacing_does_not_decide_fit() {
+        let tl = TextLayout::new();
+        let fc = ctx();
+        let lines = tl.break_into_lines_optimal(
+            &fc,
+            "PRIYA N. RAGHUNATHAN · QUALITY SYSTEMS MANAGER",
+            119.45,
+            5.25,
+            "Helvetica",
+            700,
+            FontStyle::Normal,
+            0.8925,
+            0.0,
+            Hyphens::Manual,
+            Some("en"),
+            false,
+        );
+        assert_eq!(lines[0].text.trim_end(), "PRIYA N. RAGHUNATHAN · QUALITY");
+    }
+
+    #[test]
+    fn test_optimal_ragged_run_lines_never_exceed_max_width() {
+        let tl = TextLayout::new();
+        let fc = ctx();
+        let chars: Vec<StyledChar> = RAGGED_TEXT
+            .chars()
+            .map(|ch| StyledChar {
+                ch,
+                font_family: "Helvetica".to_string(),
+                font_size: 6.375,
+                font_weight: 400,
+                font_style: FontStyle::Normal,
+                color: Color::BLACK,
+                href: None,
+                text_decoration: TextDecoration::None,
+                letter_spacing: 0.0,
+                word_spacing: 0.0,
+            })
+            .collect();
+        for width in [236.25, 200.0, 180.0, 150.0, 120.0] {
+            let lines = tl.break_runs_into_lines_optimal(
+                &fc,
+                &chars,
+                width,
+                Hyphens::Manual,
+                Some("en"),
+                false,
+            );
+            for l in &lines {
+                let text: String = l.chars.iter().map(|c| c.ch).collect();
+                assert!(
+                    l.width <= width + 0.01,
+                    "width {width}: line {text:?} is {:.2}pt, wider than the box",
+                    l.width
+                );
+            }
+        }
     }
 
     #[test]
