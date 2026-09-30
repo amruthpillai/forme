@@ -15451,3 +15451,58 @@ fn test_rtl_paragraph_with_embedded_ltr_matches_chrome_order() {
         "דבלב ABC רובע םילקש 120 אוה ריחמה"
     );
 }
+
+// ─── #157 follow-up: a link nested inside a link ─────────────────────
+
+fn linked_view_with_text_runs(outer: &str, inner: &str) -> Document {
+    let doc_json = format!(
+        r#"{{
+        "children": [{{
+            "kind": {{ "type": "View" }}, "href": "{outer}", "style": {{}},
+            "children": [{{
+                "kind": {{ "type": "Text", "content": "", "runs": [
+                    {{ "content": "Read the " }},
+                    {{ "content": "docs", "href": "{inner}" }},
+                    {{ "content": " here." }}
+                ] }},
+                "style": {{}}, "children": []
+            }}]
+        }}],
+        "metadata": {{}}
+    }}"#
+    );
+    serde_json::from_str(&doc_json).expect("document JSON")
+}
+
+/// HTML forbids a link inside a link. Forme keeps the outer link: its
+/// annotation covers the whole box, and the inner one is dropped, which
+/// used to happen silently. It now says so.
+#[test]
+fn test_a_link_nested_inside_a_different_link_warns() {
+    let doc = linked_view_with_text_runs("https://example.com/card", "https://example.com/docs");
+    let (pdf, warnings) = forme::render_with_warnings(&doc).expect("render");
+    let links = parse_link_annotations(&pdf);
+    assert_eq!(
+        links.len(),
+        1,
+        "only the outer link is clickable: {links:?}"
+    );
+    assert_eq!(links[0].uri.as_deref(), Some("https://example.com/card"));
+    assert!(
+        warnings.iter().any(|w| w.starts_with("render defect:")
+            && w.contains("https://example.com/docs")
+            && w.contains("https://example.com/card")),
+        "the dropped inner link is reported, got {warnings:?}"
+    );
+}
+
+/// The same href inside itself loses nothing, so it is not reported.
+#[test]
+fn test_a_link_nested_inside_the_same_link_does_not_warn() {
+    let doc = linked_view_with_text_runs("https://example.com/card", "https://example.com/card");
+    let (_, warnings) = forme::render_with_warnings(&doc).expect("render");
+    assert!(
+        !warnings.iter().any(|w| w.contains("nested")),
+        "no loss, no warning: {warnings:?}"
+    );
+}

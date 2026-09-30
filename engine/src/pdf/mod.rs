@@ -483,6 +483,7 @@ impl PdfWriter {
             // Collect link annotations (deferred creation until pass 2)
             let mut annotations: Vec<LinkAnnotation> = Vec::new();
             Self::collect_link_annotations(&page.elements, page.height, &mut annotations);
+            Self::warn_nested_links(&page.elements, None, &mut builder.warnings);
             per_page_annotations.push(annotations);
 
             // Collect form field annotations
@@ -4405,6 +4406,47 @@ impl PdfWriter {
     /// Collect link annotations from layout elements recursively.
     /// When an element has an href, its rect covers all children, so we skip
     /// recursing into children to avoid duplicate annotations.
+    /// Report links nested inside a different link. The outer link's
+    /// annotation covers its whole box and `collect_link_annotations` does
+    /// not look inside it, so an inner link (an element href or an inline
+    /// run's) is dropped. HTML forbids nesting links, so the outer one
+    /// winning is the defined behaviour; it used to be silent.
+    fn warn_nested_links(
+        elements: &[LayoutElement],
+        outer: Option<&str>,
+        warnings: &mut Vec<String>,
+    ) {
+        fn report(warnings: &mut Vec<String>, inner: &str, outer: &str) {
+            let msg = format!(
+                "render defect: a link to \"{inner}\" is inside a link to \"{outer}\". Links cannot be nested (HTML forbids it), so the outer link covers the whole area and the inner one was dropped"
+            );
+            if !warnings.contains(&msg) {
+                warnings.push(msg);
+            }
+        }
+        for el in elements {
+            let own = el.href.as_deref().filter(|h| !h.is_empty());
+            if let (Some(o), Some(h)) = (outer, own) {
+                if h != o {
+                    report(warnings, h, o);
+                }
+            }
+            let enclosing = outer.or(own);
+            if let Some(o) = enclosing {
+                if let DrawCommand::Text { ref lines, .. } = el.draw {
+                    for g in lines.iter().flat_map(|l| l.glyphs.iter()) {
+                        if let Some(h) = g.href.as_deref().filter(|h| !h.is_empty()) {
+                            if h != o {
+                                report(warnings, h, o);
+                            }
+                        }
+                    }
+                }
+            }
+            Self::warn_nested_links(&el.children, enclosing, warnings);
+        }
+    }
+
     fn collect_link_annotations(
         elements: &[LayoutElement],
         page_height: f64,
