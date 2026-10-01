@@ -46,6 +46,35 @@ pub struct StyledChar {
     pub word_spacing: f64,
 }
 
+/// The same fallback families are used to measure and position styled text.
+pub(crate) fn resolved_style_families(
+    chars: &[StyledChar],
+    font_context: &FontContext,
+) -> Vec<String> {
+    let mut families: Vec<String> = Vec::with_capacity(chars.len());
+    for (i, sc) in chars.iter().enumerate() {
+        let italic = matches!(sc.font_style, FontStyle::Italic | FontStyle::Oblique);
+        let previous = i
+            .checked_sub(1)
+            .filter(|&j| {
+                let prev = &chars[j];
+                prev.font_family == sc.font_family
+                    && prev.font_weight == sc.font_weight
+                    && matches!(prev.font_style, FontStyle::Italic | FontStyle::Oblique) == italic
+            })
+            .map(|j| families[j].as_str());
+        families.push(crate::font::fallback::resolve_family(
+            sc.ch,
+            &sc.font_family,
+            sc.font_weight,
+            italic,
+            previous,
+            font_context.registry(),
+        ));
+    }
+    families
+}
+
 /// A line of text from multi-style (runs) line breaking.
 #[derive(Debug, Clone)]
 pub struct RunBrokenLine {
@@ -681,6 +710,7 @@ impl TextLayout {
             return vec![];
         }
 
+        let families = resolved_style_families(chars, font_context);
         let mut widths = vec![0.0_f64; chars.len()];
         let mut i = 0;
 
@@ -689,8 +719,7 @@ impl TextLayout {
             let italic = matches!(sc.font_style, FontStyle::Italic | FontStyle::Oblique);
 
             // Check if this char's font is a custom font with shaping data
-            if let Some(font_data) = font_context.font_data(&sc.font_family, sc.font_weight, italic)
-            {
+            if let Some(font_data) = font_context.font_data(&families[i], sc.font_weight, italic) {
                 // Find the end of the contiguous run with the same font
                 let run_start = i;
                 let mut run_end = i + 1;
@@ -698,7 +727,7 @@ impl TextLayout {
                     let next = &chars[run_end];
                     let next_italic =
                         matches!(next.font_style, FontStyle::Italic | FontStyle::Oblique);
-                    if next.font_family == sc.font_family
+                    if families[run_end] == families[i]
                         && next.font_weight == sc.font_weight
                         && next_italic == italic
                         && (next.font_size - sc.font_size).abs() < 0.001
@@ -714,7 +743,7 @@ impl TextLayout {
                 if let Some(shaped) = shaping::shape_text(&run_text, font_data) {
                     let num_chars = run_end - run_start;
                     let units_per_em =
-                        font_context.units_per_em(&sc.font_family, sc.font_weight, italic);
+                        font_context.units_per_em(&families[i], sc.font_weight, italic);
                     let cluster_w = shaping::cluster_widths(
                         &shaped,
                         num_chars,
@@ -731,7 +760,7 @@ impl TextLayout {
                         if ch == PAGE_NUMBER_SENTINEL || ch == TOTAL_PAGES_SENTINEL {
                             widths[j] = font_context.char_width(
                                 ch,
-                                &chars[j].font_family,
+                                &families[j],
                                 chars[j].font_weight,
                                 italic,
                                 chars[j].font_size,
@@ -748,13 +777,9 @@ impl TextLayout {
             }
 
             // Fallback: per-char measurement
-            widths[i] = font_context.char_width(
-                sc.ch,
-                &sc.font_family,
-                sc.font_weight,
-                italic,
-                sc.font_size,
-            ) + extra_advance(sc.ch, sc.letter_spacing, sc.word_spacing);
+            widths[i] =
+                font_context.char_width(sc.ch, &families[i], sc.font_weight, italic, sc.font_size)
+                    + extra_advance(sc.ch, sc.letter_spacing, sc.word_spacing);
             i += 1;
         }
 

@@ -19,6 +19,28 @@ pub struct FontRun {
     pub family: String,
 }
 
+/// Resolve controls and combining marks with the preceding base font so
+/// fallback does not split an OpenType shaping cluster.
+pub(crate) fn resolve_family(
+    ch: char,
+    families: &str,
+    weight: u32,
+    italic: bool,
+    previous: Option<&str>,
+    registry: &FontRegistry,
+) -> String {
+    if let Some(family) = previous {
+        let shaping_control = matches!(ch, '\u{200c}' | '\u{200d}' | '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}');
+        let combining_mark = unicode_bidi::bidi_class(ch) == unicode_bidi::BidiClass::NSM;
+        if shaping_control
+            || (combining_mark && registry.resolve(family, weight, italic).has_char(ch))
+        {
+            return family.to_string();
+        }
+    }
+    registry.resolve_for_char(families, ch, weight, italic).1
+}
+
 /// Segment characters into runs by font coverage.
 ///
 /// **Fast path:** when `families` contains no comma, returns a single run
@@ -62,12 +84,19 @@ pub fn segment_by_font(
 
     // Slow path: per-character font resolution
     let mut runs = Vec::new();
-    let (_, first_family) = registry.resolve_for_char(families, chars[0], weight, italic);
+    let first_family = resolve_family(chars[0], families, weight, italic, None, registry);
     let mut current_family = first_family;
     let mut run_start = 0;
 
     for (i, &ch) in chars.iter().enumerate().skip(1) {
-        let (_, family) = registry.resolve_for_char(families, ch, weight, italic);
+        let family = resolve_family(
+            ch,
+            families,
+            weight,
+            italic,
+            Some(&current_family),
+            registry,
+        );
         if family != current_family {
             runs.push(FontRun {
                 start: run_start,

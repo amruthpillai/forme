@@ -74,17 +74,24 @@ impl CustomFontMetrics {
         let mut glyph_ids = HashMap::new();
         let mut default_advance = 0u16;
 
-        // Sample common characters to build width and glyph ID maps
-        for code in 32u32..=0xFFFF {
-            if let Some(ch) = char::from_u32(code) {
-                if let Some(glyph_id) = face.glyph_index(ch) {
-                    let advance = face.glyph_hor_advance(glyph_id).unwrap_or(0);
-                    advance_widths.insert(ch, advance);
-                    glyph_ids.insert(ch, glyph_id.0);
-                    if ch == ' ' {
-                        default_advance = advance;
-                    }
+        // Enumerate the font's Unicode cmap, including supplementary-plane emoji.
+        if let Some(cmap) = face.tables().cmap {
+            for subtable in cmap.subtables {
+                if !subtable.is_unicode() {
+                    continue;
                 }
+                subtable.codepoints(|code| {
+                    if let Some(ch) = char::from_u32(code) {
+                        if let Some(glyph_id) = face.glyph_index(ch) {
+                            let advance = face.glyph_hor_advance(glyph_id).unwrap_or(0);
+                            advance_widths.insert(ch, advance);
+                            glyph_ids.insert(ch, glyph_id.0);
+                            if ch == ' ' {
+                                default_advance = advance;
+                            }
+                        }
+                    }
+                });
             }
         }
 
