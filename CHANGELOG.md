@@ -83,7 +83,9 @@ Fixes the six externally reported issues #156, #157, #158, #159, #160 and
 
 ### Added
 
-- The HTML `dir` attribute and CSS `direction` property
+- The HTML `dir` attribute and CSS `direction` property. Correction: the
+  0.24.0 notes said `dir="rtl"` reached the engine's BiDi. It did not: the
+  attribute was copied onto `<body>` and never mapped. It is mapped now
 
 ### Internal
 
@@ -230,6 +232,10 @@ layout will change, and that is the point.
 - **`dir="rtl"` as an attribute** now reaches the engine's BiDi
 - **`border-style` with no explicit width** paints, per CSS's `medium` initial
 - **`border-collapse`** is honoured on `display: table` elements
+- **A table whose fractional columns sum to exactly 1.0 no longer reports
+  itself as clamped.** `0.6 + 0.4` of the available width left a float
+  remainder of about 3e-14, negative at some widths, so half of those tables
+  reported themselves over-full. The threshold is now a hundredth of a point
 
 ### Internal
 

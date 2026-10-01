@@ -204,26 +204,14 @@ Update peer/runtime dependencies that pin to the formepdf packages:
 - [ ] `packages/templates/package.json` — `@formepdf/react`, `@formepdf/core`
 
 ### Changelogs
-- [ ] `engine/CHANGELOG.md`
-- [ ] `server/CHANGELOG.md`
-- [ ] `packages/shared/CHANGELOG.md`
-- [ ] `packages/fonts-standard/CHANGELOG.md`
-- [ ] `packages/react/CHANGELOG.md`
-- [ ] `packages/core/CHANGELOG.md`
-- [ ] `packages/renderer/CHANGELOG.md`
-- [ ] `packages/svelte/CHANGELOG.md`
-- [ ] `packages/vue/CHANGELOG.md`
-- [ ] `packages/preact/CHANGELOG.md`
-- [ ] `packages/cli/CHANGELOG.md`
-- [ ] `packages/hono/CHANGELOG.md`
-- [ ] `packages/next/CHANGELOG.md`
-- [ ] `packages/resend/CHANGELOG.md`
-- [ ] `packages/mcp/CHANGELOG.md`
-- [ ] `packages/sdk/CHANGELOG.md`
-- [ ] `packages/tailwind/CHANGELOG.md`
-- [ ] `packages/templates/CHANGELOG.md`
-- [ ] `packages/html/CHANGELOG.md`
-- [ ] `packages/vscode/CHANGELOG.md`
+- [ ] `CHANGELOG.md` at the repo root: one entry per release covering the
+      engine, every npm package, the Python and Go SDKs and the VS Code
+      extension. Since 0.24.0 it is the only changelog kept; the per-package
+      `CHANGELOG.md` files stop at their last entries (`engine/CHANGELOG.md`
+      says so at its top). Do not add to them.
+      Lead with the changes that move existing documents, and write it as
+      public text (no em dashes)
+- [ ] `docs/changelog.mdx`: add the release's one-paragraph highlight
 
 ### READMEs (if new components, APIs, or capabilities were added)
 - [ ] `README.md` (root) — features list, component table
@@ -264,7 +252,6 @@ cd forme/packages/svelte && npm run check    # svelte-check typecheck
 cd forme/packages/vue && npm run build       # vite build + vue-tsc declarations
 cd forme/packages/preact && npm run build
 cd forme/packages/cli && npm run build
-cd forme/packages/vscode && npm run build    # copies WASM from core
 cd forme/packages/hono && npm run build
 cd forme/packages/next && npm run build
 cd forme/packages/mcp && npm run build
@@ -274,6 +261,7 @@ cd forme/packages/tailwind && npm run build
 cd forme/packages/templates && npm run build
 cd forme/html && cargo build --release && cargo fmt --check && cargo clippy --all-targets -- -D warnings
 cd forme/packages/html && ./build.sh
+cd forme/packages/vscode && npm run build    # AFTER core and html: snapshots both WASMs
 
 # 2b. Copied-artifact verification (stale-copy class — proven live, twice).
 #     vscode bundles snapshots of BOTH wasms; hashes must match sources.
