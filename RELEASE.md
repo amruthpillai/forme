@@ -515,6 +515,22 @@ If nothing is published yet, the tag is free to move (`git tag -f` plus a force
 push). Once the registries have the version, it is not: a published package
 naming a tag that has since moved makes the release unreproducible.
 
+## GitHub Release
+
+Create the GitHub release once the tag is pushed. It is what the repo page
+shows as "Latest", and it lapsed for 0.24.0 and 0.25.0, so v0.23.0 stayed
+Latest until both were backfilled at 0.26.0. `release.sh` offers this in its
+tag phase; by hand:
+
+```bash
+node scripts/release-notes.mjs 0.26.0 \
+  | gh release create v0.26.0 --verify-tag --title v0.26.0 --notes-file - --latest
+```
+
+`release-notes.mjs` prints the version's `CHANGELOG.md` entry with the 80-column
+wrapping joined back up (GitHub shows each newline in a release body as a line
+break). The changelog is the source; edit it there, not in the release.
+
 ---
 
 ## Post-Publish Verification

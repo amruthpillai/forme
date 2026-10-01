@@ -8,7 +8,7 @@
 # Idempotent by design: every publish step checks the registry first, so
 # re-running after a partial failure (an npm OTP timeout at package 9/15)
 # skips what already shipped and continues. Phases:
-#   preflight → bump → build → test → publish → tag → verify → reminders
+#   preflight → bump → build → test → publish → tag (+ GitHub release) → verify → reminders
 #
 # Deliberately NOT automated (printed as reminders at the end):
 # forme-go (separate repo, manual by choice), pdf-testkit pin bump,
@@ -241,6 +241,16 @@ if phase_reached tag; then
     confirm "Create tag v$VERSION at HEAD ($(git rev-parse --short HEAD))?" && git tag "v$VERSION"
   fi
   confirm "Push branch + tag to origin?" && { git push origin "$(git branch --show-current)"; git push origin "v$VERSION"; }
+
+  # The GitHub release is what the repo page shows as "Latest". It lapsed for
+  # 0.24.0 and 0.25.0, so v0.23.0 stayed Latest through both.
+  if gh release view "v$VERSION" >/dev/null 2>&1; then
+    note "GitHub release v$VERSION exists"
+  elif confirm "Create GitHub release v$VERSION from its CHANGELOG.md entry?"; then
+    node scripts/release-notes.mjs "$VERSION" \
+      | gh release create "v$VERSION" --verify-tag --title "v$VERSION" --notes-file - --latest \
+      || note "gh release create FAILED (is the tag pushed?)"
+  fi
 fi
 
 # ────────────────────────── verify ──────────────────────────
