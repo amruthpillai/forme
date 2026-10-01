@@ -15784,7 +15784,7 @@ fn test_rtl_marks_keep_the_shapers_offsets() {
 /// The shaper can move a mark vertically (Liberation lowers the stacked
 /// marks of "q̣̇" by 410 units, 8.01pt at 40pt), and the writer never read
 /// a glyph's y offset, so the mark was drawn 8pt off. It is drawn with a
-/// text rise around it, reset afterwards.
+/// text rise or an outline transform that includes the same offset.
 #[test]
 fn test_registered_font_vertical_mark_offsets_are_drawn() {
     let mut text = make_text("q\u{323}\u{307}", 40.0);
@@ -15801,15 +15801,32 @@ fn test_registered_font_vertical_mark_offsets_are_drawn() {
         .filter_map(|l| l.trim().strip_suffix(" Ts"))
         .map(|v| v.trim().parse().unwrap())
         .collect();
-    assert!(
-        rises.iter().any(|r| (r - rise).abs() < 0.01),
-        "a Ts of {rise:.2} for the mark, got {rises:?}:\n{stream}"
-    );
-    assert_eq!(
-        rises.last().copied(),
-        Some(0.0),
-        "the rise is reset: {rises:?}"
-    );
+    if !rises.is_empty() {
+        assert!(rises.iter().any(|r| (r - rise).abs() < 0.01));
+        assert_eq!(rises.last().copied(), Some(0.0), "text rise must reset");
+    } else {
+        // Marks drawn as paths still need the shaper's vertical offset.
+        let baseline: f64 = stream
+            .lines()
+            .find_map(|line| line.strip_suffix(" Td"))
+            .expect("base glyph text position")
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let translations: Vec<f64> = stream
+            .lines()
+            .filter_map(|line| line.strip_suffix(" cm"))
+            .filter_map(|matrix| matrix.split_whitespace().nth(5)?.parse().ok())
+            .collect();
+        assert!(
+            translations
+                .iter()
+                .any(|y| (y - baseline - rise).abs() < 0.01),
+            "mark must be {rise:.2}pt from baseline {baseline:.2}, got {translations:?}"
+        );
+    }
 }
 
 /// Redaction locates text by replaying the content stream. With registered

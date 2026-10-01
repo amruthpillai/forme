@@ -137,6 +137,113 @@ fn record_glyph_text(glyph_to_text: &mut HashMap<u16, String>, glyph: &Positione
     }
 }
 
+fn extraction_cluster(glyph: &PositionedGlyph) -> String {
+    glyph.extraction_text.clone().unwrap_or_else(|| {
+        if glyph.ligature {
+            glyph
+                .cluster_text
+                .clone()
+                .unwrap_or_else(|| glyph.char_value.to_string())
+        } else {
+            glyph.char_value.to_string()
+        }
+    })
+}
+
+fn rtl_cluster(text: &str) -> bool {
+    text.chars().next().is_some_and(|ch| {
+        matches!(
+            unicode_bidi::bidi_class(ch),
+            unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL
+        )
+    })
+}
+
+fn extraction_suffix(glyph: &PositionedGlyph) -> Option<String> {
+    let text = extraction_cluster(glyph);
+    if text.chars().nth(1).is_some()
+        && (rtl_cluster(&text)
+            || text
+                .chars()
+                .any(|ch| unicode_bidi::bidi_class(ch) == unicode_bidi::BidiClass::NSM))
+    {
+        Some(text.chars().skip(1).collect())
+    } else {
+        None
+    }
+}
+
+fn suffix_chunks(text: &str) -> Vec<String> {
+    // Keep a joiner with its following source character. Extractors
+    // otherwise discard a CID whose sole Unicode value is a format mark.
+    let mut chunks = Vec::new();
+    let mut pending = String::new();
+    for ch in text.chars() {
+        pending.push(ch);
+        if ch != '\u{200D}' && ch != '\u{200C}' {
+            chunks.push(std::mem::take(&mut pending));
+        }
+    }
+    if !pending.is_empty() {
+        chunks.push(pending);
+    }
+    chunks
+}
+
+#[derive(Default)]
+struct GlyphOutline {
+    path: String,
+    current: (f32, f32),
+}
+
+impl ttf_parser::OutlineBuilder for GlyphOutline {
+    fn move_to(&mut self, x: f32, y: f32) {
+        let _ = writeln!(
+            self.path,
+            "{} {} m",
+            pdf_number(x as f64),
+            pdf_number(y as f64)
+        );
+        self.current = (x, y);
+    }
+    fn line_to(&mut self, x: f32, y: f32) {
+        let _ = writeln!(
+            self.path,
+            "{} {} l",
+            pdf_number(x as f64),
+            pdf_number(y as f64)
+        );
+        self.current = (x, y);
+    }
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        let (x0, y0) = self.current;
+        self.curve_to(
+            x0 + (x1 - x0) * 2.0 / 3.0,
+            y0 + (y1 - y0) * 2.0 / 3.0,
+            x + (x1 - x) * 2.0 / 3.0,
+            y + (y1 - y) * 2.0 / 3.0,
+            x,
+            y,
+        );
+    }
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        let _ = writeln!(
+            self.path,
+            "{} {} {} {} {} {} c",
+            pdf_number(x1 as f64),
+            pdf_number(y1 as f64),
+            pdf_number(x2 as f64),
+            pdf_number(y2 as f64),
+            pdf_number(x as f64),
+            pdf_number(y as f64)
+        );
+        self.current = (x, y);
+    }
+    fn close(&mut self) {
+        self.path.push_str("h\n");
+    }
+}
+
 /// Embedding data for a custom TrueType font.
 #[allow(dead_code)]
 struct CustomFontEmbedData {
@@ -145,6 +252,8 @@ struct CustomFontEmbedData {
     gid_remap: HashMap<u16, u16>,
     /// Maps original glyph IDs to the text each stands for (ToUnicode CMap).
     glyph_to_text: HashMap<u16, String>,
+    glyph_to_cid: HashMap<(u16, String), u16>,
+    glyph_to_subset: HashMap<u16, u16>,
     /// Legacy fallback: maps chars to subset GIDs (for page number placeholders).
     char_to_gid: HashMap<char, u16>,
     /// The /W widths written for each subset GID (thousandths of an em,
@@ -158,6 +267,7 @@ struct CustomFontEmbedData {
 }
 
 /// Font usage data collected from layout elements.
+#[derive(Clone, Default)]
 struct FontUsage {
     /// Characters used per font (for standard font subsetting fallback).
     chars: HashSet<char>,
@@ -166,6 +276,8 @@ struct FontUsage {
     /// Maps glyph ID → the text it stands for (for ToUnicode CMap): one char
     /// for an ordinary glyph, the whole cluster for a ligature ("ffi").
     glyph_to_text: HashMap<u16, String>,
+    glyph_texts: HashSet<(u16, String)>,
+    text_widths: HashMap<(u16, String), f64>,
 }
 
 /// Tracks allocated PDF objects during writing.
@@ -468,6 +580,8 @@ impl PdfWriter {
                 tag_builder.as_mut(),
                 flatten_forms,
             );
+            let (content, text_forms) =
+                self.isolate_text_forms(content, page.width, page.height, &mut builder);
             let compressed = compress_to_vec_zlib(content.as_bytes(), 6);
 
             let content_obj_id = builder.objects.len();
@@ -503,7 +617,10 @@ impl PdfWriter {
 
             // Build resource dict for this page
             let font_resources = self.build_font_resource_dict(&builder.font_objects);
-            let xobject_resources = self.build_xobject_resource_dict(page_idx, &builder);
+            let mut xobject_resources = self.build_xobject_resource_dict(page_idx, &builder);
+            for (name, id) in text_forms {
+                let _ = write!(xobject_resources, " /{} {} 0 R", name, id);
+            }
             let ext_gstate_resources = self.build_ext_gstate_resource_dict(&builder);
             let shading_resources = self.build_shading_resource_dict(page_idx, &builder);
             let mut resources = format!("/Font << {} >>", font_resources);
@@ -1575,6 +1692,43 @@ impl PdfWriter {
         stream
     }
 
+    /// Use standard Form XObjects for lines that start with RTL combining
+    /// carriers. Readers process each form as one text context, preserving
+    /// the base/mark ordering across unrelated text baselines.
+    fn isolate_text_forms(
+        &self,
+        content: String,
+        width: f64,
+        height: f64,
+        builder: &mut PdfBuilder,
+    ) -> (String, Vec<(String, usize)>) {
+        const START: &str = "%FORME_TEXT_START\n";
+        const END: &str = "%FORME_TEXT_END\n";
+        let mut output = String::new();
+        let mut remaining = content.as_str();
+        let mut forms = Vec::new();
+        while let Some(start) = remaining.find(START) {
+            output.push_str(&remaining[..start]);
+            let after = &remaining[start + START.len()..];
+            let end = after.find(END).expect("text form end marker");
+            let compressed = compress_to_vec_zlib(&after.as_bytes()[..end], 6);
+            let id = builder.objects.len();
+            let name = format!("Tx{}", id);
+            let mut data = format!(
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 {:.2} {:.2}] /Resources << /Font << {} >> >> /Length {} /Filter /FlateDecode >>\nstream\n",
+                width, height, self.build_font_resource_dict(&builder.font_objects), compressed.len()
+            ).into_bytes();
+            data.extend_from_slice(&compressed);
+            data.extend_from_slice(b"\nendstream");
+            builder.objects.push(PdfObject { id, data });
+            let _ = writeln!(output, "q\n/{} Do\nQ", name);
+            forms.push((name, id));
+            remaining = &after[end + END.len()..];
+        }
+        output.push_str(remaining);
+        (output, forms)
+    }
+
     /// Write a single layout element as PDF operators.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
@@ -1949,9 +2103,71 @@ impl PdfWriter {
                         continue;
                     }
 
+                    // A leading zero-width RTL mark must share an extraction
+                    // context with its base. A Form isolates the line from the
+                    // previous baseline without adding characters or changing ink.
+                    let isolate = !tag_links
+                        && line
+                            .glyphs
+                            .iter()
+                            .find(|g| g.extraction_text.as_deref() != Some(""))
+                            .is_some_and(|g| {
+                                rtl_cluster(&extraction_cluster(g))
+                                    && extraction_suffix(g).is_some()
+                            });
+                    if isolate {
+                        stream.push_str("%FORME_TEXT_START\n");
+                    }
+
                     // Group consecutive glyphs by (font_family, font_weight, font_style, font_size, color)
                     // to support multi-font text runs
-                    let groups = Self::group_glyphs(&line.glyphs, tag_links);
+                    for glyph in &line.glyphs {
+                        if glyph.extraction_text.as_deref() != Some("") {
+                            continue;
+                        }
+                        let key = FontKey {
+                            family: glyph.font_family.to_string(),
+                            weight: glyph.font_weight,
+                            italic: matches!(
+                                glyph.font_style,
+                                FontStyle::Italic | FontStyle::Oblique
+                            ),
+                        };
+                        if let Some(embed) = builder.custom_font_data.get(&key) {
+                            if let (Ok(face), Some(&gid)) = (
+                                ttf_parser::Face::parse(&embed.ttf_data, 0),
+                                embed.glyph_to_subset.get(&glyph.glyph_id),
+                            ) {
+                                let mut outline = GlyphOutline::default();
+                                if face
+                                    .outline_glyph(ttf_parser::GlyphId(gid), &mut outline)
+                                    .is_some()
+                                {
+                                    let scale = glyph.font_size / face.units_per_em() as f64;
+                                    let paint = glyph.color.unwrap_or(*color);
+                                    let _ = writeln!(
+                                        stream,
+                                        "q\n{:.3} {:.3} {:.3} rg\n{:.9} 0 0 {:.9} {} {} cm\n{}f\nQ",
+                                        paint.r,
+                                        paint.g,
+                                        paint.b,
+                                        scale,
+                                        scale,
+                                        pdf_number(line.x + glyph.x_offset),
+                                        pdf_number(page_height - line.y + glyph.y_offset),
+                                        outline.path
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let text_glyphs: Vec<_> = line
+                        .glyphs
+                        .iter()
+                        .filter(|g| g.extraction_text.as_deref() != Some(""))
+                        .cloned()
+                        .collect();
+                    let groups = Self::group_glyphs(&text_glyphs, tag_links);
                     let group_links = if tag_links {
                         Self::group_link_runs(&groups)
                     } else {
@@ -2077,8 +2293,8 @@ impl PdfWriter {
                                         .iter()
                                         .map(|g| {
                                             embed_data
-                                                .gid_remap
-                                                .get(&g.glyph_id)
+                                                .glyph_to_cid
+                                                .get(&(g.glyph_id, extraction_cluster(g)))
                                                 .copied()
                                                 .unwrap_or_else(|| {
                                                     // Fallback: try char→gid
@@ -2223,6 +2439,9 @@ impl PdfWriter {
                                 line.x + line.width, strikethrough_y
                             );
                         }
+                    }
+                    if isolate {
+                        stream.push_str("%FORME_TEXT_END\n");
                     }
                 }
 
@@ -2566,8 +2785,11 @@ impl PdfWriter {
                             if let Some(embed_data) = builder.custom_font_data.get(&fk) {
                                 let mut hex = String::new();
                                 for g in group.iter() {
-                                    let gid =
-                                        embed_data.gid_remap.get(&g.glyph_id).copied().unwrap_or(0);
+                                    let gid = embed_data
+                                        .glyph_to_cid
+                                        .get(&(g.glyph_id, extraction_cluster(g)))
+                                        .copied()
+                                        .unwrap_or(0);
                                     let _ = write!(hex, "{:04X}", gid);
                                 }
                                 let _ = writeln!(stream, "<{}> Tj", hex);
@@ -3347,16 +3569,11 @@ impl PdfWriter {
                 }
                 FontData::Custom { data, .. } => {
                     let usage = font_usage_map.get(key);
-                    let used_glyph_ids = usage.map(|u| &u.glyph_ids);
-                    let used_chars = usage.map(|u| &u.chars);
-                    let glyph_to_text = usage.map(|u| &u.glyph_to_text);
                     let type0_obj_id = Self::write_custom_font_objects(
                         builder,
                         key,
                         data,
-                        used_glyph_ids.cloned().unwrap_or_default(),
-                        used_chars.cloned().unwrap_or_default(),
-                        glyph_to_text.cloned().unwrap_or_default(),
+                        usage.cloned().unwrap_or_default(),
                     )?;
                     builder.font_objects.push((key.clone(), type0_obj_id));
                 }
@@ -3391,6 +3608,8 @@ impl PdfWriter {
                             chars: HashSet::new(),
                             glyph_ids: HashSet::new(),
                             glyph_to_text: HashMap::new(),
+                            glyph_texts: HashSet::new(),
+                            text_widths: HashMap::new(),
                         });
                         usage.chars.insert(glyph.char_value);
                         // A page-number sentinel becomes digits at write
@@ -3404,6 +3623,23 @@ impl PdfWriter {
                         }
                         usage.glyph_ids.insert(glyph.glyph_id);
                         record_glyph_text(&mut usage.glyph_to_text, glyph);
+                        usage.chars.extend(extraction_cluster(glyph).chars());
+                        let pair = (glyph.glyph_id, extraction_cluster(glyph));
+                        if !pair.1.is_empty() {
+                            usage.glyph_texts.insert(pair.clone());
+                        }
+                        if let Some(suffix) = extraction_suffix(glyph) {
+                            for text in suffix_chunks(&suffix) {
+                                usage.glyph_texts.insert((0, text.clone()));
+                                usage.text_widths.insert((0, text), 0.0);
+                            }
+                        }
+                        if let Some(advance) = glyph.extraction_advance {
+                            usage
+                                .text_widths
+                                .entry(pair)
+                                .or_insert(advance / glyph.font_size * 1000.0);
+                        }
                     }
                 }
             }
@@ -4008,10 +4244,15 @@ impl PdfWriter {
         builder: &mut PdfBuilder,
         key: &FontKey,
         ttf_data: &[u8],
-        used_glyph_ids: HashSet<u16>,
-        used_chars: HashSet<char>,
-        glyph_to_text_map: HashMap<u16, String>,
+        usage: FontUsage,
     ) -> Result<usize, FormeError> {
+        let FontUsage {
+            glyph_ids: used_glyph_ids,
+            chars: used_chars,
+            glyph_to_text: glyph_to_text_map,
+            mut glyph_texts,
+            text_widths,
+        } = usage;
         let face = ttf_parser::Face::parse(ttf_data, 0).map_err(|e| {
             FormeError::FontError(format!(
                 "Failed to parse TTF data for font '{}': {}",
@@ -4050,31 +4291,55 @@ impl PdfWriter {
             }
         };
 
-        // Build char→new_gid mapping (for placeholder fallback in content stream)
-        let char_to_gid: HashMap<char, u16> = char_to_orig_gid
-            .iter()
-            .filter_map(|(&ch, &orig_gid)| gid_remap.get(&orig_gid).map(|&new_gid| (ch, new_gid)))
-            .collect();
-
-        // Build glyph_id→new_gid mapping (for shaped content stream)
-        let gid_remap_for_embed = gid_remap.clone();
-
-        // Build new_gid→text mapping for ToUnicode CMap
-        let mut new_gid_to_text: HashMap<u16, String> = HashMap::new();
-        // From shaped glyph→text mapping
-        for (orig_gid, text) in &glyph_to_text_map {
-            if let Some(&new_gid) = gid_remap.get(orig_gid) {
-                new_gid_to_text
-                    .entry(new_gid)
-                    .or_insert_with(|| text.clone());
+        for (&ch, &gid) in &char_to_orig_gid {
+            glyph_texts.insert((gid, ch.to_string()));
+        }
+        let mut pairs: Vec<_> = glyph_texts.into_iter().collect();
+        pairs.sort();
+        let mut glyph_to_cid = HashMap::new();
+        let mut cid_to_gid = HashMap::new();
+        let mut new_gid_to_text = HashMap::new();
+        let mut cid_widths = HashMap::new();
+        let mut gid_remap_for_embed = HashMap::new();
+        for (index, (orig_gid, text)) in pairs.into_iter().enumerate() {
+            let cid = u16::try_from(index + 1)
+                .map_err(|_| FormeError::FontError("Too many character mappings".to_string()))?;
+            let physical_gid = if orig_gid == 0 {
+                text.chars()
+                    .last()
+                    .and_then(|ch| char_to_orig_gid.get(&ch))
+                    .copied()
+                    .unwrap_or(0)
+            } else {
+                orig_gid
+            };
+            let new_gid = gid_remap.get(&physical_gid).copied().unwrap_or(0);
+            cid_to_gid.insert(cid, new_gid);
+            if let Some(&width) = text_widths.get(&(orig_gid, text.clone())) {
+                cid_widths.insert(cid, width);
             }
+            let unicode = if text.chars().nth(1).is_some()
+                && (rtl_cluster(&text)
+                    || text
+                        .chars()
+                        .any(|ch| unicode_bidi::bidi_class(ch) == unicode_bidi::BidiClass::NSM))
+            {
+                text.chars().take(1).collect()
+            } else {
+                text.clone()
+            };
+            new_gid_to_text.insert(cid, unicode);
+            gid_remap_for_embed.entry(orig_gid).or_insert(cid);
+            glyph_to_cid.insert((orig_gid, text), cid);
         }
-        // Fill in from char→gid mapping too
-        for (&ch, &new_gid) in &char_to_gid {
-            new_gid_to_text
-                .entry(new_gid)
-                .or_insert_with(|| ch.to_string());
-        }
+        let char_to_gid = char_to_orig_gid
+            .iter()
+            .filter_map(|(&ch, &gid)| {
+                glyph_to_cid
+                    .get(&(gid, ch.to_string()))
+                    .map(|&cid| (ch, cid))
+            })
+            .collect();
 
         let pdf_font_name = Self::sanitize_font_name(&key.family, key.weight, key.italic);
 
@@ -4136,10 +4401,33 @@ impl PdfWriter {
         });
 
         // 3. CIDFont dictionary (DescendantFont)
+        let map_id = builder.objects.len();
+        let mut cid_bytes =
+            vec![0u8; (cid_to_gid.keys().copied().max().unwrap_or(0) as usize + 1) * 2];
+        for (&cid, &gid) in &cid_to_gid {
+            cid_bytes[cid as usize * 2..cid as usize * 2 + 2].copy_from_slice(&gid.to_be_bytes());
+        }
+        let compressed = compress_to_vec_zlib(&cid_bytes, 6);
+        let mut map_data = format!(
+            "<< /Length {} /Filter /FlateDecode >>\nstream\n",
+            compressed.len()
+        )
+        .into_bytes();
+        map_data.extend_from_slice(&compressed);
+        map_data.extend_from_slice(b"\nendstream");
+        builder.objects.push(PdfObject {
+            id: map_id,
+            data: map_data,
+        });
         let cidfont_id = builder.objects.len();
         // Build /W array using new_gid→width from subset face
-        let (w_array, pdf_widths) =
-            Self::build_w_array_from_gids(&gid_remap, &subset_face, subset_upem);
+        let (w_array, pdf_widths) = Self::build_w_array_from_gids(
+            &cid_to_gid,
+            &subset_face,
+            subset_upem,
+            &new_gid_to_text,
+            &cid_widths,
+        );
         let default_width = subset_face
             .glyph_hor_advance(ttf_parser::GlyphId(0))
             .map(|adv| (adv as f64 * 1000.0 / subset_upem as f64) as u32)
@@ -4148,8 +4436,8 @@ impl PdfWriter {
             "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{} \
              /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
              /FontDescriptor {} 0 R /DW {} /W {} \
-             /CIDToGIDMap /Identity >>",
-            pdf_font_name, font_descriptor_id, default_width, w_array,
+             /CIDToGIDMap {} 0 R >>",
+            pdf_font_name, font_descriptor_id, default_width, w_array, map_id,
         );
         builder.objects.push(PdfObject {
             id: cidfont_id,
@@ -4194,6 +4482,8 @@ impl PdfWriter {
                 ttf_data: embed_ttf,
                 gid_remap: gid_remap_for_embed,
                 glyph_to_text: glyph_to_text_map,
+                glyph_to_cid,
+                glyph_to_subset: gid_remap,
                 char_to_gid,
                 pdf_widths,
                 default_width,
@@ -4211,25 +4501,33 @@ impl PdfWriter {
         gid_remap: &HashMap<u16, u16>,
         face: &ttf_parser::Face,
         units_per_em: u16,
+        texts: &HashMap<u16, String>,
+        widths: &HashMap<u16, f64>,
     ) -> (String, HashMap<u16, f64>) {
         let scale = 1000.0 / units_per_em as f64;
 
         let mut entries: Vec<(u16, f64)> = Vec::new();
         let mut seen_gids: HashSet<u16> = HashSet::new();
 
-        for &new_gid in gid_remap.values() {
-            if seen_gids.contains(&new_gid) {
+        for (&cid, &new_gid) in gid_remap {
+            if seen_gids.contains(&cid) {
                 continue;
             }
-            seen_gids.insert(new_gid);
+            seen_gids.insert(cid);
             let advance = face
                 .glyph_hor_advance(ttf_parser::GlyphId(new_gid))
                 .unwrap_or(0);
             // Exact, not truncated: a truncated width drew every glyph up to
             // 1/1000 em narrower than layout placed it, a drift that grew
             // along the line.
-            let width = advance as f64 * scale;
-            entries.push((new_gid, width));
+            let width = widths.get(&cid).copied().unwrap_or_else(|| {
+                if texts.get(&cid).is_some_and(String::is_empty) {
+                    0.0
+                } else {
+                    advance as f64 * scale
+                }
+            });
+            entries.push((cid, width));
         }
 
         entries.sort_by_key(|(gid, _)| *gid);
@@ -4255,8 +4553,8 @@ impl PdfWriter {
     ) -> String {
         let mut gid_to_unicode: Vec<(u16, String)> = gid_to_text
             .iter()
-            .filter(|(_, text)| !text.is_empty())
             .map(|(&gid, text)| {
+                let text = text.as_str();
                 let hex: String = text
                     .encode_utf16()
                     .map(|unit| format!("{:04X}", unit))
@@ -4416,7 +4714,10 @@ impl PdfWriter {
                 }
             })
             .collect();
-        if !any && rises.iter().all(|r| *r == 0.0) {
+        if !any
+            && rises.iter().all(|r| *r == 0.0)
+            && group.iter().all(|g| extraction_suffix(g).is_none())
+        {
             return None;
         }
         // One TJ per run of equal rise; a change of rise (a mark the shaper
@@ -4439,7 +4740,29 @@ impl PdfWriter {
                 out.push('[');
                 open = true;
             }
+            if rtl_cluster(&extraction_cluster(group[i])) {
+                if let Some(suffix) = extraction_suffix(group[i]) {
+                    out.push_str("] TJ\n3 Tr\n0 Tc\n<");
+                    for text in suffix_chunks(&suffix).into_iter().rev() {
+                        if let Some(cid) = embed.glyph_to_cid.get(&(0, text)) {
+                            let _ = write!(out, "{:04X}", cid);
+                        }
+                    }
+                    let _ = write!(out, "> Tj\n0 Tr\n{} Tc\n[", pdf_number(char_spacing));
+                }
+            }
             let _ = write!(out, "<{:04X}>", gid);
+            if let Some(suffix) =
+                extraction_suffix(group[i]).filter(|_| !rtl_cluster(&extraction_cluster(group[i])))
+            {
+                out.push_str("] TJ\n3 Tr\n0 Tc\n<");
+                for text in suffix_chunks(&suffix) {
+                    if let Some(cid) = embed.glyph_to_cid.get(&(0, text)) {
+                        let _ = write!(out, "{:04X}", cid);
+                    }
+                }
+                let _ = write!(out, "> Tj\n0 Tr\n{} Tc\n[", pdf_number(char_spacing));
+            }
             if adjustments[i] != 0.0 && i + 1 < gids.len() {
                 let _ = write!(out, " {:.2} ", adjustments[i]);
             }
@@ -5542,6 +5865,8 @@ mod tests {
                                 text_decoration: TextDecoration::None,
                                 letter_spacing: 0.0,
                                 cluster_text: None,
+                                extraction_text: None,
+                                extraction_advance: None,
                                 ligature: false,
                             }],
                             word_spacing: 0.0,
@@ -5590,6 +5915,8 @@ mod tests {
                                 text_decoration: TextDecoration::None,
                                 letter_spacing: 0.0,
                                 cluster_text: None,
+                                extraction_text: None,
+                                extraction_advance: None,
                                 ligature: false,
                             }],
                             word_spacing: 0.0,
@@ -5748,6 +6075,8 @@ mod tests {
             text_decoration: TextDecoration::None,
             letter_spacing: 0.0,
             cluster_text: cluster.map(str::to_string),
+            extraction_text: None,
+            extraction_advance: None,
             ligature,
         }
     }
@@ -5855,6 +6184,8 @@ mod tests {
                             text_decoration: TextDecoration::None,
                             letter_spacing: 0.0,
                             cluster_text: None,
+                            extraction_text: None,
+                            extraction_advance: None,
                             ligature: false,
                         }],
                         word_spacing: 0.0,
