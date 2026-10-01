@@ -76,3 +76,63 @@ fn styled_fallback_uses_shaped_widths_for_line_breaking() {
         1
     );
 }
+
+#[test]
+fn plain_and_styled_text_resolve_unencodable_whitespace_alike() {
+    // U+202F (narrow no-break space, French number grouping) is whitespace
+    // with no WinAnsi byte. Both paths must draw it in builtin Noto Sans,
+    // not "?" in Helvetica.
+    let text = "Total 1\u{202F}000\u{202F}€ due";
+    let plain = serde_json::json!({ "type": "Text", "content": text });
+    let styled = serde_json::json!({
+        "type": "Text", "content": "", "runs": [{ "content": text }]
+    });
+    for (path, kind) in [("plain", plain), ("styled", styled)] {
+        let doc: forme::Document = serde_json::from_value(serde_json::json!({
+            "children": [{ "kind": kind, "style": {}, "children": [] }],
+            "metadata": {}
+        }))
+        .unwrap();
+        let (pdf, warnings) = forme::render_with_warnings(&doc).unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("U+202F")),
+            "{path} text drew U+202F as \"?\": {warnings:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&pdf).contains("NotoSans"),
+            "{path} text did not fall back to Noto Sans"
+        );
+    }
+}
+
+#[test]
+fn controls_stay_with_a_registered_font_under_pdfa() {
+    // A tab or newline has no glyph in any font. Resolving it by coverage
+    // pulled styled runs into Helvetica, which PDF/A cannot embed.
+    let font = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        include_bytes!("fixtures/fonts/NotoSansDevanagari-Regular.ttf"),
+    );
+    let text = "नम\tस्ते\nनमस्ते";
+    let plain = serde_json::json!({ "type": "Text", "content": text });
+    let styled = serde_json::json!({
+        "type": "Text", "content": "", "runs": [{ "content": text }]
+    });
+    for (path, kind) in [("plain", plain), ("styled", styled)] {
+        let doc: forme::Document = serde_json::from_value(serde_json::json!({
+            "children": [{ "kind": kind, "style": { "fontFamily": "Dev" }, "children": [] }],
+            "metadata": {},
+            "pdfa": "2b",
+            "fonts": [{
+                "family": "Dev",
+                "src": format!("data:font/ttf;base64,{font}"),
+                "weight": 400,
+                "italic": false
+            }]
+        }))
+        .unwrap();
+        if let Err(e) = forme::render(&doc) {
+            panic!("{path} text with controls failed under PDF/A: {e}");
+        }
+    }
+}
