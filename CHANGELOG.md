@@ -6,6 +6,90 @@ Entries for 0.10.0 through 0.23.0 were backfilled on 2026-09-17 from the
 published GitHub release notes, which were the record of those releases
 while this file lapsed. They are reproduced, not rewritten.
 
+## [0.26.0] - 2026-09-30
+
+Text drawn where it is laid out. Registered fonts now keep their kerning,
+justification and mark placement on the page, right-to-left text reads in the
+right order, lines stay inside their boxes, and tagged output stops nesting its
+marked content. All packages share the line: engine (crates.io `forme-pdf`),
+every `@formepdf/*` npm package, `formepdf` (PyPI), `forme-go` (tag v0.26.0),
+and the VS Code extension.
+
+Fixes the six externally reported issues #156, #157, #158, #159, #160 and
+#161, and #162.
+
+### Changed: these move existing documents
+
+- **Registered fonts are drawn at their laid-out positions.** Layout placed
+  shaped glyphs with the shaper's advances and the Knuth-Plass positions, but
+  the writer drew each run as one plain `Tj`, so a viewer advanced every glyph
+  by the font's own width and dropped the rest. Measured in Liberation Sans,
+  the font every PDF/UA and PDF/A document embeds: a 24pt kerning line drawn
+  17.8pt wider than laid out, justified paragraphs drawn ragged (`Tw` does not
+  apply to Type0 fonts, ISO 32000-1 9.3.3), and Hebrew points beside their
+  letters. Registered-font text is now written as positioned `TJ` arrays,
+  with `Ts` for marks the shaper moves vertically, and `/W` widths are exact
+  rather than truncated. Text with nothing to adjust keeps a plain `Tj`.
+  Standard fonts (Helvetica, Times, Courier) are unchanged. Output in
+  registered fonts grows about 1%
+- **Right-to-left text reads in the right order.** The shaper returns an RTL
+  run in visual order and the BiDi reordering reversed it again, so Hebrew
+  was drawn backwards; and a line mixing RTL text with a number or a Latin
+  word was never reordered at all. Both are fixed, checked against Chrome's
+  glyph order. Arabic now extracts identically to Chrome. Hebrew points keep
+  the shaper's placement through the reordering
+- **Ragged-right lines stay inside their box.** Knuth-Plass let word spaces
+  shrink when choosing breaks for every alignment, but only justified text
+  narrows its spaces when drawn, so a left-aligned line could run a few
+  points past its box. Spaces are now incompressible unless the text is
+  justified, and the letter-spacing after a line's last character, which
+  paints nothing, no longer decides whether the line fits. Some paragraphs
+  re-break; the new breaks match Chrome's
+- **Justified text.** A justified paragraph's last line used to inherit the
+  previous line's word spacing (#162). Underlines and strikes on justified
+  lines, and inline link click areas, no longer count the word spacing twice
+- **HTML margin boxes are sized by the boxes present.** Each was a fixed third
+  of the edge, so a lone `@top-center` header wider than a third wrapped where
+  Chrome keeps it on one line. A lone box, or a centre box without side
+  boxes, now takes the whole edge, and side boxes without a centre split it
+- **Fixed headers, footers and watermarks inherit the document's style**
+  (#160). On the HTML path, margin boxes inherit from the page, not `<body>`,
+  as CSS specifies
+- **Tagged output no longer nests marked content.** An element kept its
+  marked-content sequence open while its children were written, so nearly
+  every sequence sat inside another and a table cell's text belonged to its
+  cell and its row at once. Wrapper elements now carry no content of their
+  own and box ink is marked as an artifact. veraPDF's "Nested MCID" warnings
+  on the corpus go from about 10,000 to 0, and tagged files are about 5%
+  smaller. Inline link text is now tagged inside its `/Link` element (#157)
+- **A component that returns an array or fragment renders** (#159), and a
+  `Page` returned by a component at the Document level becomes a real page
+
+### Fixed
+
+- Ligature glyphs copy as their whole text in ToUnicode (#156)
+- Inline links inside text get link annotations (#157)
+- Document info strings (title, author, outline titles) are encoded
+  correctly, and DocInfo and XMP agree on the producer (#158)
+- Lists keep `.map()` and component children in template mode (#161); a
+  child a list still drops is reported in the render `warnings`
+- DotPlot draws its `yLabel`, and both axis titles get room beside the tick
+  labels
+- Knuth-Plass `hyphen_penalty` is applied
+- A link nested inside a different link is reported instead of dropped
+  silently
+- Two Northmoor templates' totals tables fill their column, and the
+  termination letter's prose is widened to stay on one page
+
+### Added
+
+- The HTML `dir` attribute and CSS `direction` property
+
+### Internal
+
+- The CLA workflow no longer locks pull requests when they close
+- Visual tests keep concurrent runs' temporary files apart
+
 ## [0.25.0] - 2026-09-19
 
 Flex geometry, corrected in four places where the engine measured items by
