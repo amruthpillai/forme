@@ -1,7 +1,12 @@
-import { readFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { expect, it } from 'vitest';
 import { renderPdf } from '../src/index';
+
+const popplerAvailable = spawnSync('pdftotext', ['-v']).status === 0;
 
 const cases = [
   ['NotoSansHebrew', 'שָׁלוֹם עוֹלָם', 'rtl'],
@@ -9,6 +14,7 @@ const cases = [
   ['NotoNaskhArabic', 'مَرْحَبًا بِالْعَالَم', 'rtl'],
   ['NotoSansDevanagari', 'नमस्ते दुनिया अनुभव कौशल', 'ltr'],
   ['NotoSansDevanagari', 'कु कू के कै को कौ कि की कं कौ के कु कू', 'ltr'],
+  ['NotoSansDevanagari', 'र्कि र्की र्को र्कौ क्षि त्रि', 'ltr'],
 ] as const;
 
 it.each(cases)('extracts %s: %s', async (family, text, direction) => {
@@ -29,6 +35,19 @@ it.each(cases)('extracts %s: %s', async (family, text, direction) => {
       const content = await page.getTextContent();
       const extracted = content.items.map(item => 'str' in item ? item.str : '').join('');
       expect(extracted, runs ? 'styled text' : 'plain text').toBe(text.replaceAll('\n', ''));
+      if (popplerAvailable) {
+        const dir = mkdtempSync(join(tmpdir(), 'forme-unicode-'));
+        try {
+          const path = join(dir, 'text.pdf');
+          writeFileSync(path, pdf);
+          const poppler = execFileSync('pdftotext', [path, '-'], { encoding: 'utf8' });
+          // Poppler adds directional wrappers and page/line separators.
+          expect(poppler.replace(/[\u202A-\u202E\n\r\f]/g, '').trim(), 'pdftotext')
+            .toBe(text.replaceAll('\n', ''));
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      }
     } finally {
       await task.destroy();
     }

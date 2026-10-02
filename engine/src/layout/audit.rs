@@ -533,7 +533,6 @@ mod tests {
                 letter_spacing: 0.0,
                 cluster_text: None,
                 extraction_text: None,
-                extraction_advance: None,
                 ligature: false,
             })
             .collect();
