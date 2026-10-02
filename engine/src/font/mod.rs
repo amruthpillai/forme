@@ -74,17 +74,24 @@ impl CustomFontMetrics {
         let mut glyph_ids = HashMap::new();
         let mut default_advance = 0u16;
 
-        // Sample common characters to build width and glyph ID maps
-        for code in 32u32..=0xFFFF {
-            if let Some(ch) = char::from_u32(code) {
-                if let Some(glyph_id) = face.glyph_index(ch) {
-                    let advance = face.glyph_hor_advance(glyph_id).unwrap_or(0);
-                    advance_widths.insert(ch, advance);
-                    glyph_ids.insert(ch, glyph_id.0);
-                    if ch == ' ' {
-                        default_advance = advance;
-                    }
+        // Enumerate the font's Unicode cmap, including supplementary-plane emoji.
+        if let Some(cmap) = face.tables().cmap {
+            for subtable in cmap.subtables {
+                if !subtable.is_unicode() {
+                    continue;
                 }
+                subtable.codepoints(|code| {
+                    if let Some(ch) = char::from_u32(code) {
+                        if let Some(glyph_id) = face.glyph_index(ch) {
+                            let advance = face.glyph_hor_advance(glyph_id).unwrap_or(0);
+                            advance_widths.insert(ch, advance);
+                            glyph_ids.insert(ch, glyph_id.0);
+                            if ch == ' ' {
+                                default_advance = advance;
+                            }
+                        }
+                    }
+                });
             }
         }
 
@@ -311,16 +318,16 @@ impl FontRegistry {
     ) -> (&FontData, String) {
         let snapped_weight = if weight >= 600 { 700 } else { 400 };
 
-        // Page-number sentinels (U+0002/U+0003) are pseudo-characters
-        // replaced by DIGITS at write time — no real font has a glyph for
-        // them, so a coverage walk would always shunt them into the final
-        // Helvetica fallback, splitting the surrounding text's font (and
-        // breaking PDF/A when that font is a registered custom one). They
-        // are font-neutral: take the first REGISTERED family in the chain,
-        // ignoring coverage. Known boundary: a registered font genuinely
-        // lacking digit glyphs still renders .notdef page numbers, like
-        // any other missing glyph.
-        if ch == crate::layout::PAGE_NUMBER_SENTINEL || ch == crate::layout::TOTAL_PAGES_SENTINEL {
+        // Controls — tabs, newlines, and the page-number sentinels
+        // (U+0002/U+0003) replaced by DIGITS at write time — have no glyph
+        // in a real font, so a coverage walk would always shunt them into
+        // the final Helvetica fallback, splitting the surrounding text's
+        // font (and breaking PDF/A when that font is a registered custom
+        // one). They are font-neutral: take the first REGISTERED family in
+        // the chain, ignoring coverage. Known boundary: a registered font
+        // genuinely lacking digit glyphs still renders .notdef page
+        // numbers, like any other missing glyph.
+        if ch.is_control() {
             for family in families.split(',') {
                 let family = family.trim().trim_matches('"').trim_matches('\'');
                 if family.is_empty() {
@@ -518,7 +525,7 @@ impl FontContext {
         // fall back to per-char resolution only when the char isn't covered
         let font_data = if !family.contains(',') {
             let primary = self.registry.resolve(family, weight, italic);
-            if ch.is_whitespace() || primary.has_char(ch) {
+            if ch.is_control() || primary.has_char(ch) {
                 primary
             } else {
                 let (data, _) = self.registry.resolve_for_char(family, ch, weight, italic);

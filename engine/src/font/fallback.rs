@@ -19,6 +19,28 @@ pub struct FontRun {
     pub family: String,
 }
 
+/// Resolve controls and combining marks with the preceding base font so
+/// fallback does not split an OpenType shaping cluster.
+pub(crate) fn resolve_family(
+    ch: char,
+    families: &str,
+    weight: u32,
+    italic: bool,
+    previous: Option<&str>,
+    registry: &FontRegistry,
+) -> String {
+    if let Some(family) = previous {
+        let shaping_control = matches!(ch, '\u{200c}' | '\u{200d}' | '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}');
+        let combining_mark = unicode_bidi::bidi_class(ch) == unicode_bidi::BidiClass::NSM;
+        if shaping_control
+            || (combining_mark && registry.resolve(family, weight, italic).has_char(ch))
+        {
+            return family.to_string();
+        }
+    }
+    registry.resolve_for_char(families, ch, weight, italic).1
+}
+
 /// Segment characters into runs by font coverage.
 ///
 /// **Fast path:** when `families` contains no comma, returns a single run
@@ -38,17 +60,14 @@ pub fn segment_by_font(
     }
 
     // Fast path: single font family — check if all chars are covered.
-    // Page-number sentinels are exempt like whitespace: they're replaced
-    // by digits at write time, so no font can (or needs to) cover them.
+    // Controls are exempt: no font draws newlines or tabs, and the
+    // page-number sentinels are replaced by digits at write time. Other
+    // whitespace is not — U+202F has no WinAnsi byte, so it must fall
+    // back exactly as it does in styled runs.
     if !families.contains(',') {
         let family = families.trim().trim_matches('"').trim_matches('\'');
         let font = registry.resolve(family, weight, italic);
-        let all_covered = chars.iter().all(|&ch| {
-            ch.is_whitespace()
-                || ch == crate::layout::PAGE_NUMBER_SENTINEL
-                || ch == crate::layout::TOTAL_PAGES_SENTINEL
-                || font.has_char(ch)
-        });
+        let all_covered = chars.iter().all(|&ch| ch.is_control() || font.has_char(ch));
         if all_covered {
             return vec![FontRun {
                 start: 0,
@@ -62,12 +81,19 @@ pub fn segment_by_font(
 
     // Slow path: per-character font resolution
     let mut runs = Vec::new();
-    let (_, first_family) = registry.resolve_for_char(families, chars[0], weight, italic);
+    let first_family = resolve_family(chars[0], families, weight, italic, None, registry);
     let mut current_family = first_family;
     let mut run_start = 0;
 
     for (i, &ch) in chars.iter().enumerate().skip(1) {
-        let (_, family) = registry.resolve_for_char(families, ch, weight, italic);
+        let family = resolve_family(
+            ch,
+            families,
+            weight,
+            italic,
+            Some(&current_family),
+            registry,
+        );
         if family != current_family {
             runs.push(FontRun {
                 start: run_start,

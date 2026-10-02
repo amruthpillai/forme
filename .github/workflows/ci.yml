@@ -711,6 +711,9 @@ jobs:
         # check and a comment. Structure only by default; the PDFs stay here.
         # One batch per commit: the service judges document presence when a
         # batch completes, so nothing else in this workflow uploads.
+        # Fork PRs get no secrets, so they cannot upload; the validators above
+        # still gate them. The first fork PR (#172) failed here on the empty token.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         env:
           PDF_TESTKIT_SERVICE_URL: https://review-api.formepdf.com
           PDF_TESTKIT_TOKEN: ${{ secrets.PDF_TESTKIT_TOKEN }}
