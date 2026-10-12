@@ -10325,6 +10325,45 @@ fn test_svg_no_viewbox_unchanged() {
 }
 
 #[test]
+fn test_svg_restores_graphics_state_before_following_text() {
+    for tagged in [false, true] {
+        for (opacity, transform) in [(Some(0.3), false), (None, true), (Some(0.3), true)] {
+            let mut svg = make_svg(
+                30.0,
+                30.0,
+                Some("0 0 30 30"),
+                r##"<rect width="30" height="30" fill="#ff0000"/>"##,
+            );
+            svg.style.opacity = opacity;
+            if transform {
+                svg.style.transform = Some(vec![TransformOp::Translate { x: 17.0, y: 9.0 }]);
+            }
+            let mut doc = default_doc(vec![svg, make_text("Following", 12.0)]);
+            doc.tagged = tagged;
+            let stream = decompress_pdf_streams(&render_to_pdf(&doc));
+            let mut depth = 0;
+            let mut saw_text = false;
+            for operator in stream.split_whitespace() {
+                match operator {
+                    "q" => depth += 1,
+                    "Q" => depth -= 1,
+                    "BT" => {
+                        assert_eq!(
+                            depth, 0,
+                            "following text inherits SVG state: opacity={opacity:?}, transform={transform}, tagged={tagged}\n{stream}"
+                        );
+                        saw_text = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saw_text, "following text must be drawn");
+        }
+    }
+}
+
+#[test]
 fn test_canvas_renders_at_display_coordinates() {
     // Canvas reuses DrawCommand::Svg via canvas_ops_to_svg_commands. Canvas
     // ops are constructed in display coordinates, so the new viewBox plumbing

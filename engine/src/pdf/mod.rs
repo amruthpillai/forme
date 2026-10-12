@@ -2317,23 +2317,6 @@ impl PdfWriter {
                         x, y, element.width, element.height
                     );
                 }
-                if tagged_mcid.is_some() {
-                    let _ = writeln!(stream, "EMC");
-                    if let Some(ref mut tb) = tag_builder {
-                        tb.end_element();
-                    }
-                } else if is_artifact {
-                    let _ = writeln!(stream, "EMC");
-                } else if wrap_own_draw_as_artifact {
-                    // Unreachable today (graphics arms map to /Figure under
-                    // UA-2), but if a forbidden-content role ever gained a
-                    // graphics draw, close its /Artifact bracket and element.
-                    let _ = writeln!(stream, "EMC");
-                    if let Some(ref mut tb) = tag_builder {
-                        tb.end_element();
-                    }
-                }
-                return; // Don't increment counter again for children
             }
 
             DrawCommand::ImagePlaceholder => {
@@ -2345,23 +2328,6 @@ impl PdfWriter {
                     "q\n0.9 0.9 0.9 rg\n{:.2} {:.2} {:.2} {:.2} re\nf\nQ\n",
                     x, y, element.width, element.height
                 );
-                if tagged_mcid.is_some() {
-                    let _ = writeln!(stream, "EMC");
-                    if let Some(ref mut tb) = tag_builder {
-                        tb.end_element();
-                    }
-                } else if is_artifact {
-                    let _ = writeln!(stream, "EMC");
-                } else if wrap_own_draw_as_artifact {
-                    // Unreachable today (graphics arms map to /Figure under
-                    // UA-2), but if a forbidden-content role ever gained a
-                    // graphics draw, close its /Artifact bracket and element.
-                    let _ = writeln!(stream, "EMC");
-                    if let Some(ref mut tb) = tag_builder {
-                        tb.end_element();
-                    }
-                }
-                return;
             }
 
             DrawCommand::Svg {
@@ -2420,23 +2386,6 @@ impl PdfWriter {
                 Self::write_svg_commands(stream, commands, &builder.ext_gstate_map);
 
                 let _ = writeln!(stream, "Q");
-                if tagged_mcid.is_some() {
-                    let _ = writeln!(stream, "EMC");
-                    if let Some(ref mut tb) = tag_builder {
-                        tb.end_element();
-                    }
-                } else if is_artifact {
-                    let _ = writeln!(stream, "EMC");
-                } else if wrap_own_draw_as_artifact {
-                    // Unreachable today (graphics arms map to /Figure under
-                    // UA-2), but if a forbidden-content role ever gained a
-                    // graphics draw, close its /Artifact bracket and element.
-                    let _ = writeln!(stream, "EMC");
-                    if let Some(ref mut tb) = tag_builder {
-                        tb.end_element();
-                    }
-                }
-                return;
             }
 
             DrawCommand::Barcode {
@@ -2460,23 +2409,6 @@ impl PdfWriter {
                     }
                 }
                 let _ = writeln!(stream, "f\nQ");
-                if tagged_mcid.is_some() {
-                    let _ = writeln!(stream, "EMC");
-                    if let Some(ref mut tb) = tag_builder {
-                        tb.end_element();
-                    }
-                } else if is_artifact {
-                    let _ = writeln!(stream, "EMC");
-                } else if wrap_own_draw_as_artifact {
-                    // Unreachable today (graphics arms map to /Figure under
-                    // UA-2), but if a forbidden-content role ever gained a
-                    // graphics draw, close its /Artifact bracket and element.
-                    let _ = writeln!(stream, "EMC");
-                    if let Some(ref mut tb) = tag_builder {
-                        tb.end_element();
-                    }
-                }
-                return;
             }
 
             DrawCommand::QrCode {
@@ -2501,23 +2433,6 @@ impl PdfWriter {
                     }
                 }
                 let _ = writeln!(stream, "f\nQ");
-                if tagged_mcid.is_some() {
-                    let _ = writeln!(stream, "EMC");
-                    if let Some(ref mut tb) = tag_builder {
-                        tb.end_element();
-                    }
-                } else if is_artifact {
-                    let _ = writeln!(stream, "EMC");
-                } else if wrap_own_draw_as_artifact {
-                    // Unreachable today (graphics arms map to /Figure under
-                    // UA-2), but if a forbidden-content role ever gained a
-                    // graphics draw, close its /Artifact bracket and element.
-                    let _ = writeln!(stream, "EMC");
-                    if let Some(ref mut tb) = tag_builder {
-                        tb.end_element();
-                    }
-                }
-                return;
             }
 
             DrawCommand::Chart { primitives } => {
@@ -2536,23 +2451,6 @@ impl PdfWriter {
                 }
 
                 let _ = writeln!(stream, "Q");
-                if tagged_mcid.is_some() {
-                    let _ = writeln!(stream, "EMC");
-                    if let Some(ref mut tb) = tag_builder {
-                        tb.end_element();
-                    }
-                } else if is_artifact {
-                    let _ = writeln!(stream, "EMC");
-                } else if wrap_own_draw_as_artifact {
-                    // Unreachable today (graphics arms map to /Figure under
-                    // UA-2), but if a forbidden-content role ever gained a
-                    // graphics draw, close its /Artifact bracket and element.
-                    let _ = writeln!(stream, "EMC");
-                    if let Some(ref mut tb) = tag_builder {
-                        tb.end_element();
-                    }
-                }
-                return;
             }
 
             DrawCommand::Watermark {
@@ -2665,23 +2563,6 @@ impl PdfWriter {
                 }
                 let _ = writeln!(stream, "ET");
                 let _ = writeln!(stream, "Q");
-                if tagged_mcid.is_some() {
-                    let _ = writeln!(stream, "EMC");
-                    if let Some(ref mut tb) = tag_builder {
-                        tb.end_element();
-                    }
-                } else if is_artifact {
-                    let _ = writeln!(stream, "EMC");
-                } else if wrap_own_draw_as_artifact {
-                    // Unreachable today (graphics arms map to /Figure under
-                    // UA-2), but if a forbidden-content role ever gained a
-                    // graphics draw, close its /Artifact bracket and element.
-                    let _ = writeln!(stream, "EMC");
-                    if let Some(ref mut tb) = tag_builder {
-                        tb.end_element();
-                    }
-                }
-                return;
             }
 
             DrawCommand::FormField { field_type, .. } => {
@@ -2955,7 +2836,15 @@ impl PdfWriter {
         // When the element's Rect has a non-zero border_radius, clip to the
         // rounded path so descendants don't visually overflow the rounded
         // corners. Plain rectangular clip otherwise.
-        let clip_overflow = matches!(element.overflow, Overflow::Hidden);
+        // Leaf drawings skip children, but still restore opacity, transforms and tagging below.
+        let draws_children = matches!(
+            element.draw,
+            DrawCommand::None
+                | DrawCommand::Rect { .. }
+                | DrawCommand::Text { .. }
+                | DrawCommand::FormField { .. }
+        );
+        let clip_overflow = draws_children && matches!(element.overflow, Overflow::Hidden);
         if clip_overflow {
             let clip_x = element.x;
             let clip_y = page_height - element.y - element.height;
@@ -2985,20 +2874,22 @@ impl PdfWriter {
             }
         }
 
-        for child in &element.children {
-            self.write_element(
-                stream,
-                child,
-                page_height,
-                builder,
-                page_idx,
-                element_counter,
-                gradient_counter,
-                page_number,
-                total_pages,
-                tag_builder.as_deref_mut(),
-                flatten_forms,
-            );
+        if draws_children {
+            for child in &element.children {
+                self.write_element(
+                    stream,
+                    child,
+                    page_height,
+                    builder,
+                    page_idx,
+                    element_counter,
+                    gradient_counter,
+                    page_number,
+                    total_pages,
+                    tag_builder.as_deref_mut(),
+                    flatten_forms,
+                );
+            }
         }
 
         if clip_overflow {
