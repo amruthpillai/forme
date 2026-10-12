@@ -6,6 +6,12 @@ Entries for 0.10.0 through 0.23.0 were backfilled on 2026-09-17 from the
 published GitHub release notes, which were the record of those releases
 while this file lapsed. They are reproduced, not rewritten.
 
+## [Unreleased]
+
+### Fixed
+
+- Greedy line breaking no longer draws trailing line breaks as missing glyphs in plain or styled text (#191).
+
 ## [0.28.0] - 2026-10-06
 
 Text measured and justified the way it is drawn. Content-sized text boxes
